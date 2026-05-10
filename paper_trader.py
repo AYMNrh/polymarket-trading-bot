@@ -4,13 +4,13 @@ uses whale data as a confirmation/denial overlay. Trades many small positions
 to learn fast. Self-learning reviews every resolved trade.
 
 Strategy flow:
-1. Scan all weather markets (20+ cities, temp buckets)
+1. Scan curated US weather markets only
 2. Compute EV from forecast vs market price (weather bot logic)
 3. Check whale activity in each market (from scraper cache)
-4. If whale aligns -> boost confidence + size
-5. If whale opposes -> reduce confidence + size
-6. Execute paper trade if confidence > threshold
-7. Self-learning reviews closed trades, adjusts parameters
+4. If whale aligns -> modest confidence + size boost
+5. If whale opposes -> reduce confidence or veto weak trades
+6. Execute paper trade only after liquidity and risk filters pass
+7. Self-learning reviews closed trades daily; parameter changes are opt-in
 
 No wallet, no API keys, no real money needed.
 """
@@ -29,11 +29,17 @@ logger = logging.getLogger(__name__)
 
 PAPER_STATE_FILE = Path(__file__).parent / "data" / "paper_portfolio.json"
 PAPER_TRADES_LOG = Path(__file__).parent / "data" / "paper_trades.jsonl"
+FORECAST_CACHE: dict[tuple[str, str, str], Optional[float]] = {}
 
 DEFAULT_BANKROLL = 100.0
 MAX_BET = 2.0
 MIN_EV = 0.05
 EV_THRESHOLD = 0.05
+MIN_VOLUME = 200.0
+MAX_SPREAD = 0.08
+MAX_OPEN_POSITIONS = 12
+MAX_CITY_POSITIONS = 2
+EXPERIMENT_DAYS = 3
 
 WHALE_BOOST = 0.15
 WHALE_PENALTY = -0.20
@@ -69,6 +75,10 @@ FORECAST_LOCATIONS = {
 
 def _get_forecast_temp(city: str, date_str: str, unit: str = 'F') -> Optional[float]:
     """Fetch forecast temperature from Open-Meteo ECMWF API."""
+    cache_key = (city, date_str, unit)
+    if cache_key in FORECAST_CACHE:
+        return FORECAST_CACHE[cache_key]
+
     loc = FORECAST_LOCATIONS.get(city)
     if not loc:
         return None
@@ -85,11 +95,14 @@ def _get_forecast_temp(city: str, date_str: str, unit: str = 'F') -> Optional[fl
             if 'error' not in data:
                 for d, t in zip(data['daily']['time'], data['daily']['temperature_2m_max']):
                     if d == date_str and t is not None:
-                        return round(t) if unit == 'F' else round(t, 1)
+                        result = round(t) if unit == 'F' else round(t, 1)
+                        FORECAST_CACHE[cache_key] = result
+                        return result
             break
         except Exception:
             if attempt < 1:
                 time.sleep(2)
+    FORECAST_CACHE[cache_key] = None
     return None
 
 # =============================================================================
@@ -112,9 +125,21 @@ def _load_state() -> dict:
         "parameters": {
             "min_ev": MIN_EV,
             "max_bet": MAX_BET,
-            "max_positions": 20,
+            "max_positions": MAX_OPEN_POSITIONS,
+            "max_city_positions": MAX_CITY_POSITIONS,
             "whale_boost": WHALE_BOOST,
+            "max_price": 0.45,
+            "kelly_fraction": 0.25,
+            "min_volume": MIN_VOLUME,
+            "max_spread": MAX_SPREAD,
         },
+        "experiment": {
+            "scope": "us-weather-paper-v1",
+            "duration_days": EXPERIMENT_DAYS,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        },
+        "last_cycle_report": {},
+        "last_learning_review_date": None,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -151,7 +176,55 @@ def _kelly_size(kelly: float, bankroll: float) -> float:
     return min(raw, MAX_BET)
 
 
-print('Module functions defined OK')
+def _extract_bucket_bounds(title: str) -> tuple[float, float]:
+    """Parse the traded temperature bucket from a market title."""
+    bucket_low, bucket_high = 0.0, 0.0
+    temp_match = re.findall(r'(\d+)\s*[Â°F]', title)
+    if len(temp_match) >= 2:
+        bucket_low = float(temp_match[-2])
+        bucket_high = float(temp_match[-1])
+    elif len(temp_match) == 1:
+        bucket_low = bucket_high = float(temp_match[0])
+
+    title_lower = title.lower()
+    if 'or below' in title_lower:
+        bucket_low, bucket_high = -999.0, bucket_low or bucket_high or 0.0
+    if 'or higher' in title_lower or 'or above' in title_lower:
+        bucket_low, bucket_high = bucket_low or 0.0, 999.0
+    return bucket_low, bucket_high
+
+
+def _extract_market_date(title: str) -> str | None:
+    """Extract YYYY-MM-DD market date from the title when available."""
+    title_lower = title.lower()
+    date_match = re.search(
+        r'(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d+)',
+        title_lower,
+    )
+    if not date_match:
+        return None
+
+    month_name = date_match.group(1)
+    day = date_match.group(2)
+    month_map = {
+        'january': '01', 'february': '02', 'march': '03', 'april': '04',
+        'may': '05', 'june': '06', 'july': '07', 'august': '08',
+        'september': '09', 'october': '10', 'november': '11', 'december': '12',
+    }
+    year = datetime.now(timezone.utc).yea
+    return f"{year}-{month_map[month_name]}-{day.zfill(2)}"
+
+
+def _market_review_id(position: dict) -> str:
+    """Stable identifier for deduping reviewed paper trades."""
+    parts = [
+        str(position.get("condition_id") or ""),
+        str(position.get("market_id") or ""),
+        str(position.get("side") or ""),
+        str(position.get("entry_ts") or ""),
+        str(position.get("closed_at") or ""),
+    ]
+    return "|".join(parts)
 
 
 class PaperTrader:
@@ -174,12 +247,78 @@ class PaperTrader:
             self._open_positions = {k: v for k, v in self.state.get("positions", {}).items()
                                     if v.get("status") == "open"}
 
+    def _open_positions_for_city(self, city: str) -> int:
+        if not city:
+            return 0
+        return sum(
+            1 for p in self._open_positions.values()
+            if str(p.get("city", "")).lower() == city.lower()
+        )
+
+    def _daily_review_due(self) -> bool:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        return self.state.get("last_learning_review_date") != today
+
+    def mark_learning_review_complete(self):
+        self.state["last_learning_review_date"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        _save_state(self.state)
+
+    def build_cycle_report(self, markets: list[dict], whale_positions: list[dict]) -> dict:
+        """Summarize candidate quality before execution."""
+        report = {
+            "discovered_markets": len(markets),
+            "markets_with_whale_signal": 0,
+            "unique_us_cities": len({m.get("city") for m in markets if m.get("city")}),
+            "liquid_candidates": 0,
+            "ev_candidates": 0,
+            "tradable_candidates": 0,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        params = self.state.get("parameters", {})
+        min_volume = float(params.get("min_volume", MIN_VOLUME))
+        max_spread = float(params.get("max_spread", MAX_SPREAD))
+        min_ev = float(params.get("min_ev", MIN_EV))
+        max_price = float(params.get("max_price", 0.45))
+
+        for market in markets:
+            bid = market.get("bestBid")
+            ask = market.get("bestAsk")
+            volume = float(market.get("volume", 0) or 0)
+            if bid is not None and ask is not None and volume >= min_volume:
+                spread = float(ask) - float(bid)
+                if 0 < float(bid) < 1 and 0 < float(ask) < 1 and spread <= max_spread:
+                    report["liquid_candidates"] += 1
+                    fair_price = self._estimate_fair_price(
+                        market.get("question", "?"),
+                        market.get("date"),
+                        bucket_low=_extract_bucket_bounds(market.get("question", "?"))[0],
+                        bucket_high=_extract_bucket_bounds(market.get("question", "?"))[1],
+                    )
+                    if fair_price is not None:
+                        edge = abs(fair_price - float(bid))
+                        if edge >= min_ev and float(bid) < max_price:
+                            report["ev_candidates"] += 1
+                            overlay = self._check_whale_overlay(
+                                market.get("question", "?"),
+                                "BUY" if fair_price > float(bid) else "SELL",
+                                whale_positions,
+                            )
+                            if overlay["count"] > 0:
+                                report["markets_with_whale_signal"] += 1
+                            if overlay["adjustment"] > -0.3:
+                                report["tradable_candidates"] += 1
+        self.state["last_cycle_report"] = report
+        _save_state(self.state)
+        return report
+
     def evaluate_and_trade(self, market: dict, whale_positions: list[dict] = None,
                            fair_price: float = None) -> dict | None:
         """Core method: evaluate a market and execute a paper trade if edge exists."""
         title = market.get("question", "?")
         condition_id = market.get("conditionId", "")
         market_id = market.get("id", "")
+        city = market.get("city", "")
+        market_date = market.get("date")
 
         # --- Self-learning: extract temp range from title ---
         bucket_low, bucket_high = 0.0, 0.0
@@ -193,20 +332,27 @@ class PaperTrader:
             bucket_low, bucket_high = -999.0, bucket_low or bucket_high or 0
         if 'or higher' in title.lower() or 'or above' in title.lower():
             bucket_low, bucket_high = bucket_low or 0, 999.0
+        bucket_low, bucket_high = _extract_bucket_bounds(title)
 
         # --- Pre-compute forecast temp (shared with _estimate_fair_price) ---
         forecast_temp = None
         date_str_forecast = None
+        extracted_market_date = _extract_market_date(title)
+        if extracted_market_date:
+            date_str_forecast = extracted_market_date
         title_lower = title.lower()
         for cn in FORECAST_LOCATIONS:
             if cn.lower() in title_lower:
-                date_match = re.search(r'(may|april|june|july|august|september|october)\s+(\d+)', title_lower)
-                if date_match:
-                    month_name = date_match.group(1)
-                    day = date_match.group(2)
-                    month_map = {'may':'05','april':'04','june':'06','july':'07','august':'08','september':'09','october':'10'}
-                    date_str_forecast = f"2026-{month_map.get(month_name,'05')}-{day.zfill(2)}"
-                else:
+                if not date_str_forecast:
+                    date_match = re.search(r'(may|april|june|july|august|september|october)\s+(\d+)', title_lower)
+                    if date_match:
+                        month_name = date_match.group(1)
+                        day = date_match.group(2)
+                        month_map = {'may':'05','april':'04','june':'06','july':'07','august':'08','september':'09','october':'10'}
+                        date_str_forecast = f"{datetime.now(timezone.utc).year}-{month_map.get(month_name,'05')}-{day.zfill(2)}"
+                    else:
+                        date_str_forecast = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")
+                if not date_str_forecast:
                     date_str_forecast = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")
                 unit = FORECAST_LOCATIONS[cn]['unit']
                 forecast_temp = _get_forecast_temp(cn, date_str_forecast, unit)
@@ -217,9 +363,15 @@ class PaperTrader:
         current_min_ev = params.get('min_ev', EV_THRESHOLD)
         current_max_bet = params.get('max_bet', MAX_BET)
         current_max_price = params.get('max_price', 0.45)
+        current_kelly_fraction = params.get('kelly_fraction', 0.25)
+        current_min_volume = float(params.get('min_volume', MIN_VOLUME))
+        current_max_spread = float(params.get('max_spread', MAX_SPREAD))
+        current_max_positions = int(params.get('max_positions', MAX_OPEN_POSITIONS))
+        current_max_city_positions = int(params.get('max_city_positions', MAX_CITY_POSITIONS))
 
         best_bid = market.get("bestBid")
         best_ask = market.get("bestAsk")
+        volume = float(market.get("volume", 0) or 0)
         outcome_prices = market.get("outcomePrices", "[]")
         if isinstance(outcome_prices, str):
             try:
@@ -236,7 +388,9 @@ class PaperTrader:
         if best_bid is None or best_ask is None:
             return None
         spread = float(best_ask) - float(best_bid)
-        if spread > 0.10:
+        if spread > current_max_spread:
+            return None
+        if volume < current_min_volume:
             return None
 
         # Max price check from learned parameters
@@ -245,7 +399,13 @@ class PaperTrader:
 
         # Default fair price if not provided
         if fair_price is None:
-            fair_price = self._estimate_fair_price(title, date_str_forecast, forecast_temp)
+            fair_price = self._estimate_fair_price(
+                title,
+                date_str_forecast,
+                forecast_temp,
+                bucket_low=bucket_low,
+                bucket_high=bucket_high,
+            )
         if fair_price is None or fair_price <= 0 or fair_price >= 1:
             return None
 
@@ -262,20 +422,26 @@ class PaperTrader:
         confidence = base_confidence + whale_overlay["adjustment"]
         confidence = max(0.05, min(0.99, confidence))
 
+        # Whales are an overlay, not the source of truth. Strong opposition vetoes only weak edges.
+        if whale_overlay["adjustment"] <= -0.20 and abs(ev) < max(current_min_ev * 2, 0.10):
+            return None
         if confidence < 0.3:
             return None
 
         # Kelly sizing with whale boost
         kelly_raw = _kelly_fraction(fair_price, price) if direction == "BUY" else _kelly_fraction(1-fair_price, 1-price)
         kelly_adjusted = kelly_raw * (1.0 + whale_overlay["size_boost"])
-        allocation = _kelly_size(kelly_adjusted * 0.25, self.state["bankroll"])
+        effective_kelly_fraction = max(0.0, float(current_kelly_fraction))
+        allocation = _kelly_size(kelly_adjusted * effective_kelly_fraction, self.state["bankroll"])
         allocation = min(allocation, current_max_bet)
 
         # Cap exposure at 50% of bankroll and max 15 positions
         current_exposure = sum(p.get("value", 0) for p in self._open_positions.values())
         if current_exposure + allocation > self.state["bankroll"] * 0.5:
             return None
-        if len(self._open_positions) >= 15:
+        if len(self._open_positions) >= current_max_positions:
+            return None
+        if city and self._open_positions_for_city(city) >= current_max_city_positions:
             return None
 
         # Opposite-position check
@@ -296,6 +462,8 @@ class PaperTrader:
             "market_id": market_id,
             "condition_id": condition_id,
             "title": title[:100],
+            "city": city,
+            "market_volume": volume,
             "side": direction,
             "entry_price": round(price, 4),
             "current_price": round(price, 4),
@@ -309,13 +477,15 @@ class PaperTrader:
             "whale_aligned": whale_overlay["aligned"],
             "whale_count": whale_overlay["count"],
             "whale_adjustment": round(whale_overlay["adjustment"], 3),
-            "kelly_fraction": round(kelly_adjusted * 0.25, 4),
+            "kelly_fraction": round(kelly_adjusted * effective_kelly_fraction, 4),
             "entry_ts": datetime.now(timezone.utc).isoformat(),
             "status": "open",
             "bucket_low": bucket_low,
             "bucket_high": bucket_high,
+            "market_date": market_date or date_str_forecast,
             "forecast_temp": forecast_temp,
             "forecast_source": "ecmwf",
+            "reserved_capital": round(allocation, 2),
         }
 
         # Dedup by condition_id first
@@ -388,12 +558,20 @@ class PaperTrader:
             pos["settlement_price"] = resolved_price
             if pos.get("side") == "SELL":
                 pnl = (pos["entry_price"] - resolved_price) * pos["shares"]
+                settlement_value = (1 - resolved_price) * pos["shares"]
             else:
                 pnl = (resolved_price - pos["entry_price"]) * pos["shares"]
+                settlement_value = resolved_price * pos["shares"]
             pos["pnl"] = round(pnl, 2)
+            pos["exit_price"] = resolved_price
+            pos["close_reason"] = "resolved"
+            pos["settlement_value"] = round(settlement_value, 2)
             pos["resolved_outcome"] = "win" if pnl >= 0 else "loss"
 
-        self.state["bankroll"] += pos.get("pnl", 0)
+        bankroll_credit = pos.get("settlement_value")
+        if bankroll_credit is None:
+            bankroll_credit = pos.get("reserved_capital", 0) + pos.get("pnl", 0)
+        self.state["bankroll"] = round(self.state["bankroll"] + bankroll_credit, 2)
         if pos.get("pnl", 0) >= 0:
             self.state["wins"] += 1
         else:
@@ -437,10 +615,17 @@ class PaperTrader:
     def _title_overlaps(self, a: str, b: str) -> bool:
         if not a or not b:
             return False
-        a_cities = set(re.findall(r'(new york|chicago|miami|denver|dallas|london|tokyo|paris|berlin|mexico|la|sf|seattle|boston|phoenix|houston|atlanta)', a))
-        b_cities = set(re.findall(r'(new york|chicago|miami|denver|dallas|london|tokyo|paris|berlin|mexico|la|sf|seattle|boston|phoenix|houston|atlanta)', b))
-        a_dates = set(re.findall(r'(may|april|june|july)\s+\d+', a))
-        b_dates = set(re.findall(r'(may|april|june|july)\s+\d+', b))
+        city_tokens = [
+            "new york city", "new york", "nyc", "chicago", "miami", "dallas", "denver",
+            "seattle", "atlanta", "boston", "phoenix", "houston", "los angeles",
+            "san francisco",
+        ]
+        city_pattern = "(" + "|".join(re.escape(token) for token in city_tokens) + ")"
+        month_pattern = r'(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d+'
+        a_cities = set(re.findall(city_pattern, a))
+        b_cities = set(re.findall(city_pattern, b))
+        a_dates = set(re.findall(month_pattern, a))
+        b_dates = set(re.findall(month_pattern, b))
         city_match = bool(a_cities & b_cities)
         date_match = bool(a_dates & b_dates)
         return city_match and date_match
@@ -450,7 +635,7 @@ class PaperTrader:
         return f"{slug}-{direction}"
 
     def discover_weather_markets(self) -> list[dict]:
-        """Discover today's weather markets via Gamma event slugs."""
+        """Discover curated US weather markets for the paper-trading experiment."""
         cities_slugs = {
             "new-york": "NYC", "chicago": "Chicago", "miami": "Miami",
             "dallas": "Dallas", "denver": "Denver", "seattle": "Seattle",
@@ -468,6 +653,8 @@ class PaperTrader:
         markets = []
 
         for city_slug, city_name in cities_slugs.items():
+            if FORECAST_LOCATIONS.get(city_name, {}).get("region") != "us":
+                continue
             for offset in range(3):
                 dt = now + timedelta(days=offset)
                 month_str = months[dt.month - 1]
@@ -506,7 +693,8 @@ class PaperTrader:
 
         return markets
 
-    def _estimate_fair_price(self, title: str, date_str: str = None, forecast_temp: float = None) -> Optional[float]:
+    def _estimate_fair_price(self, title: str, date_str: str = None, forecast_temp: float = None,
+                             bucket_low: float = None, bucket_high: float = None) -> Optional[float]:
         """Estimate fair price from real Open-Meteo ECMWF weather forecasts.
         If forecast_temp is provided, skips the API call."""
         title_lower = title.lower()
@@ -517,6 +705,37 @@ class PaperTrader:
                 break
         if not city:
             return None
+
+        if not date_str:
+            date_str = _extract_market_date(title)
+        if not date_str:
+            date_str = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")
+
+        loc = FORECAST_LOCATIONS.get(city)
+        if not loc:
+            return None
+
+        unit = loc["unit"]
+        if forecast_temp is None:
+            forecast_temp = _get_forecast_temp(city, date_str, unit)
+        if forecast_temp is None:
+            return None
+
+        if bucket_low is None or bucket_high is None:
+            bucket_low, bucket_high = _extract_bucket_bounds(title)
+
+        sigma = 4.0 if unit == "F" else 2.2
+        if bucket_low == -999.0:
+            upper = bucket_high + 0.5
+            prob = _norm_cdf((upper - forecast_temp) / sigma)
+        elif bucket_high == 999.0:
+            lower = bucket_low - 0.5
+            prob = 1.0 - _norm_cdf((lower - forecast_temp) / sigma)
+        else:
+            lower = bucket_low - 0.5
+            upper = bucket_high + 0.5
+            prob = _norm_cdf((upper - forecast_temp) / sigma) - _norm_cdf((lower - forecast_temp) / sigma)
+        return round(max(0.01, min(0.99, prob)), 4)
 
         if not date_str:
             date_match = re.search(r'(may|april|june|july|august|september|october)\s+(\d+)', title_lower)
@@ -652,12 +871,10 @@ class PaperTrader:
             }
 
             # Get actual temp from ERA5
-            date_str = None
-            import re as _re
-            date_match = _re.search(r'(\d{4}-\d{2}-\d{2})', p.get('event_slug',''))
-            if date_match:
-                date_str = date_match.group(1)
-            elif p.get('closed_at'):
+            date_str = p.get('market_date')
+            if not date_str and p.get('title'):
+                date_str = _extract_market_date(p['title'])
+            if not date_str and p.get('closed_at'):
                 date_str = p['closed_at'][:10]
 
             actual_temp = None
@@ -678,7 +895,13 @@ class PaperTrader:
                 'forecast_snapshots': [forecast_snapshot] if forecast_snapshot['best'] else [],
                 'actual_temp': actual_temp,
                 'market_snapshots': [{'entry_price': p.get('entry_price', 0)}],
+                'all_outcomes': [{
+                    'market_id': str(p.get('market_id', '')),
+                    'range': (p.get('bucket_low', 0), p.get('bucket_high', 0)),
+                }],
+                'source_trade_id': _market_review_id(p),
                 'position': {
+                    'market_id': str(p.get('market_id', '')),
                     'entry_price': p.get('entry_price', 0),
                     'exit_price': p.get('exit_price'),
                     'pnl': p.get('pnl', 0),
@@ -689,7 +912,7 @@ class PaperTrader:
         return result
 
     def apply_learned_parameters(self):
-        """Apply parameters learned by self_learning engine."""
+        """Apply parameters learned by self_learning engine when explicitly requested."""
         notes_file = Path(__file__).parent / "data" / "strategy_notes.json"
         if not notes_file.exists():
             return {}
@@ -723,6 +946,9 @@ class PaperTrader:
             "losses": self.state.get("losses", 0),
             "total_pnl": round(total_pnl, 2),
             "parameters": self.state.get("parameters", {}),
+            "experiment": self.state.get("experiment", {}),
+            "last_cycle_report": self.state.get("last_cycle_report", {}),
+            "last_learning_review_date": self.state.get("last_learning_review_date"),
             "last_sync": self.state.get("last_sync", ""),
         }
 

@@ -271,6 +271,31 @@ def _render_dashboard() -> str:
     main = f"""
         <div class="section">
             <h2>🐋 Whales</h2>
+            <div class="stats" style="grid-template-columns:repeat(auto-fit,minmax(140px,1fr));margin-top:10px">
+                <div class="stat-card">
+                    <div class="value">{cycle.get('discovered_markets', 0)}</div>
+                    <div class="label">Markets Scanned</div>
+                </div>
+                <div class="stat-card">
+                    <div class="value">{cycle.get('liquid_candidates', 0)}</div>
+                    <div class="label">Liquid Candidates</div>
+                </div>
+                <div class="stat-card">
+                    <div class="value">{cycle.get('ev_candidates', 0)}</div>
+                    <div class="label">EV Candidates</div>
+                </div>
+                <div class="stat-card">
+                    <div class="value">{cycle.get('tradable_candidates', 0)}</div>
+                    <div class="label">Tradable After Overlay</div>
+                </div>
+            </div>
+
+            <p style="color:#555;font-size:0.8em;margin:10px 0 14px">
+                Experiment: {experiment.get('scope', 'paper-v1')} ·
+                Duration: {experiment.get('duration_days', 3)} days ·
+                Last learning review: {summary.get('last_learning_review_date') or 'pending'}
+            </p>
+
             <table>
                 <tr><th>Label</th><th>Address</th><th>Volume</th><th>Trades</th><th>Portfolio</th><th>PnL</th><th>Win Rate</th><th>Status</th></tr>
                 {whale_rows}
@@ -803,6 +828,8 @@ def _render_paper_portfolio() -> str:
 
     bankroll_pct = summary["exposure"] / max(1, summary["bankroll"]) * 100
     params = summary.get("parameters", {})
+    cycle = summary.get("last_cycle_report", {})
+    experiment = summary.get("experiment", {})
 
     win_rate = summary["wins"] / max(1, summary["wins"] + summary["losses"]) * 100
 
@@ -877,7 +904,7 @@ def _render_paper_portfolio() -> str:
             <p style="color:#666;font-size:0.85em;margin-bottom:10px">
                 Core: weather forecast EV (fair price vs market price).
                 Overlay: 🐋 = whale confirmed (same direction). 2+ whales = consensus boost.
-                Self-learning adjusts min_ev, max_bet, kelly automatically.
+                Daily review logs learning insights; parameters are not auto-applied intraday.
             </p>
 
             <table>

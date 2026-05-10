@@ -36,6 +36,8 @@ except Exception:
 if TRADES_LOG.exists():
     mtime = datetime.fromtimestamp(os.path.getmtime(TRADES_LOG), tz=timezone.utc)
     age = (datetime.now(timezone.utc) - mtime).total_seconds() / 3600
+    if age > MAX_STALE_HOURS:
+        issues.append(f"Trade log stale: {age:.1f}h since last update (threshold: {MAX_STALE_HOURS}h)")
 else:
     issues.append("No trade log found")
 

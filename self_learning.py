@@ -26,7 +26,7 @@ DEFAULT_PARAMS = {
     "max_price": 0.45,
     "kelly_fraction": 0.25,
     "min_volume": 200,
-    "max_bet": 20.0,
+    "max_bet": 2.0,
 }
 
 
@@ -75,6 +75,7 @@ class SelfLearningEngine:
             "parameter_adjustments": dict(DEFAULT_PARAMS),
             "performance_history": [],
             "pattern_notes": {},
+            "reviewed_market_ids": [],
         }
 
     def _save_notes(self):
@@ -90,15 +91,28 @@ class SelfLearningEngine:
         if not resolved_markets:
             return new_observations
 
-        wins = [m for m in resolved_markets if m.get("resolved_outcome") == "win"]
-        losses = [m for m in resolved_markets if m.get("resolved_outcome") == "loss"]
+        reviewed_ids = set(self.notes.get("reviewed_market_ids", []))
+        fresh_markets = []
+        fresh_ids = []
+        for market in resolved_markets:
+            market_id = self._market_review_id(market)
+            if market_id in reviewed_ids:
+                continue
+            fresh_markets.append(market)
+            fresh_ids.append(market_id)
+
+        if not fresh_markets:
+            return new_observations
+
+        wins = [m for m in fresh_markets if m.get("resolved_outcome") == "win"]
+        losses = [m for m in fresh_markets if m.get("resolved_outcome") == "loss"]
 
         logger.info("📝 Reviewing %d resolved markets (%dW/%dL)",
-                     len(resolved_markets), len(wins), len(losses))
+                     len(fresh_markets), len(wins), len(losses))
 
         # --- Pattern 1: Performance by bucket type ---
         buckets = defaultdict(lambda: {"wins": 0, "losses": 0, "pnl": 0.0, "count": 0})
-        for m in resolved_markets:
+        for m in fresh_markets:
             btype = self._bucket_type(m)
             buckets[btype]["count"] += 1
             pnl = m.get("pnl", 0) or 0
@@ -139,7 +153,7 @@ class SelfLearningEngine:
 
         # --- Pattern 2: Forecast source accuracy ---
         sources = defaultdict(lambda: {"count": 0, "total_error": 0.0})
-        for m in resolved_markets:
+        for m in fresh_markets:
             for snap in reversed(m.get("forecast_snapshots", [])):
                 source = snap.get("best_source", snap.get("source", "unknown"))
                 forecast = snap.get("temp", snap.get("best"))
@@ -159,16 +173,16 @@ class SelfLearningEngine:
             logger.info("  🌡️  %s", obs)
 
         # --- Parameter Adjustment Logic ---
-        adjustments = self._adjust_parameters(wins, losses, resolved_markets)
+        adjustments = self._adjust_parameters(wins, losses, fresh_markets)
         if adjustments:
             new_observations.extend(adjustments)
             self.notes["parameter_adjustments"].update(adjustments)
 
         # --- Save ---
-        total_pnl = sum(m.get("pnl", 0) or 0 for m in resolved_markets)
+        total_pnl = sum(m.get("pnl", 0) or 0 for m in fresh_markets)
         self.notes.setdefault("performance_history", []).append({
             "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-            "trades": len(resolved_markets),
+            "trades": len(fresh_markets),
             "wins": len(wins),
             "losses": len(losses),
             "pnl": round(total_pnl, 2),
@@ -176,6 +190,7 @@ class SelfLearningEngine:
         })
         self.notes["last_review"] = datetime.now(timezone.utc).isoformat()
         self.notes["observations"].extend(new_observations)
+        self.notes["reviewed_market_ids"] = (self.notes.get("reviewed_market_ids", []) + fresh_ids)[-5000:]
         self._save_notes()
 
         return new_observations
@@ -266,6 +281,22 @@ class SelfLearningEngine:
         return "\n".join(lines)
 
     @staticmethod
+    def _market_review_id(market: dict) -> str:
+        source_trade_id = market.get("source_trade_id")
+        if source_trade_id:
+            return str(source_trade_id)
+
+        position = market.get("position") or {}
+        parts = [
+            str(market.get("condition_id") or position.get("condition_id") or market.get("market_id") or ""),
+            str(market.get("date") or market.get("market_date") or ""),
+            str(market.get("resolved_outcome") or ""),
+            str(position.get("entry_price") or market.get("entry_price") or ""),
+            str(market.get("pnl") or position.get("pnl") or ""),
+        ]
+        return "|".join(parts)
+
+    @staticmethod
     def _bucket_type(market: dict) -> str:
         """Classify a market by its bucket type."""
         outcomes = market.get("all_outcomes", [])
@@ -278,6 +309,9 @@ class SelfLearningEngine:
             if market.get("position") and o.get("market_id") == str(market["position"].get("market_id")):
                 traded = o
                 break
+
+        if not traded and len(outcomes) == 1:
+            traded = outcomes[0]
 
         if not traded:
             return "unknown"

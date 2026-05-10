@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""EV + whale overlay paper trading cycle — cron entrypoint."""
-import logging, json, sys, os
+"""EV + whale overlay paper trading cycle cron entrypoint."""
+import logging
+import os
+import sys
 
 PROJECT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT not in sys.path:
@@ -8,69 +10,77 @@ if PROJECT not in sys.path:
 
 logging.basicConfig(level=logging.WARNING, stream=sys.stdout)
 
-from polymarket_scraper import PolymarketScraper
-from paper_trader import PaperTrader, _save_state
 from config import load_config
+from paper_trader import PaperTrader, _save_state
+from polymarket_scraper import PolymarketScrape
+
 
 cfg = load_config()
 scraper = PolymarketScraper()
 trader = PaperTrader(bankroll=100.0)
 
-# 1. Discover weather markets via event slugs (proven approach)
+# 1. Discover curated US weather markets
 markets = trader.discover_weather_markets()
-print(f'Markets: {len(markets)}')
+print(f"Discovered US weather markets: {len(markets)}")
 
-# 2. Get whale overlay
-wallets = cfg.get('watched_wallets', [])
+# 2. Load whale overlay inputs
+wallets = cfg.get("watched_wallets", [])
 all_pos = []
-for w in wallets:
-    if w.get('label') in ('ColdMath', 'Sharky6999', 'RN1'):
+for wallet in wallets:
+    if wallet.get("label") in ("ColdMath", "Sharky6999", "RN1"):
         try:
-            p = scraper.get_positions(w['address'])
-            if p:
-                all_pos.extend(p)
+            positions = scraper.get_positions(wallet["address"])
+            if positions:
+                all_pos.extend(positions)
         except Exception:
             pass
 
-print(f'Whale positions: {len(all_pos)}')
+print(f"Whale positions loaded: {len(all_pos)}")
+cycle_report = trader.build_cycle_report(markets, all_pos)
+print(
+    "Candidates:"
+    f" liquid={cycle_report['liquid_candidates']}"
+    f" ev={cycle_report['ev_candidates']}"
+    f" tradable={cycle_report['tradable_candidates']}"
+    f" whale={cycle_report['markets_with_whale_signal']}"
+)
 
 # 3. Evaluate and trade
 opened = 0
-for m in markets:
+errors = 0
+for market in markets:
     try:
-        r = trader.evaluate_and_trade(m, whale_positions=all_pos)
-        if r:
+        result = trader.evaluate_and_trade(market, whale_positions=all_pos)
+        if result and result.get("status") == "open":
             opened += 1
     except Exception:
-        pass
+        errors += 1
 
 # 4. Mark-to-market and resolve closed positions
 trader.update_prices()
 resolved = trader.resolve_positions()
 if resolved:
-    print(f'Resolved: {resolved} positions')
+    print(f"Resolved: {resolved} positions")
 
-# 5. Self-learning: review resolved trades and adjust parameters
-if resolved:
+# 5. Self-learning: daily review only, no intraday parameter application
+if resolved and trader._daily_review_due():
     from self_learning import SelfLearningEngine
+
     learner = SelfLearningEngine()
-    
-    # Export closed positions in self-learning format
     learning_data = trader.export_for_learning()
     if learning_data:
         observations = learner.review_resolved_trades(learning_data)
         if observations:
-            print(f'Self-learning: {len(observations)} insights generated')
+            print(f"Daily review: {len(observations)} insights generated")
             for obs in observations[:5]:
-                print(f'  {obs[:80]}')
-    
-    # Apply learned parameters back to trading engine
-    applied = trader.apply_learned_parameters()
-    if applied:
-        print(f'Parameters updated: {applied}')
+                print(f"  {obs[:80]}")
+        trader.mark_learning_review_complete()
 
-s = trader.summary()
-print(f'Opened: {opened}, Open: {s["open_positions"]}, PnL: ${s["total_pnl"]:.2f}, Exp: ${s["exposure"]:.2f}')
+summary = trader.summary()
+print(
+    f"Opened: {opened}, Open: {summary['open_positions']}, "
+    f"PnL: ${summary['total_pnl']:.2f}, Exp: ${summary['exposure']:.2f}, Errors: {errors}"
+)
 
 # 6. Persist state
 _save_state(trader.state)
