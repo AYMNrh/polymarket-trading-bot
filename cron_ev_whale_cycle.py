@@ -12,7 +12,33 @@ logging.basicConfig(level=logging.WARNING, stream=sys.stdout)
 
 from config import load_config
 from paper_trader import PaperTrader, _save_state
-from polymarket_scraper import PolymarketScrape
+from polymarket_scraper import PolymarketScraper
+
+
+def load_whale_positions(scraper: PolymarketScraper, cfg: dict) -> tuple[list[dict], int]:
+    """Load overlay positions from configured watched wallets."""
+    wallets = cfg.get("watched_wallets", [])
+    allowed_labels = set(cfg.get("overlay_wallet_labels", []))
+    seen_addresses = set()
+    all_positions = []
+    used_wallets = 0
+
+    for wallet in wallets:
+        address = wallet.get("address")
+        label = wallet.get("label", "")
+        if not address or address in seen_addresses:
+            continue
+        if allowed_labels and label not in allowed_labels:
+            continue
+        seen_addresses.add(address)
+        used_wallets += 1
+        try:
+            positions = scraper.get_positions(address)
+            if positions:
+                all_positions.extend(positions)
+        except Exception:
+            pass
+    return all_positions, used_wallets
 
 
 cfg = load_config()
@@ -24,17 +50,8 @@ markets = trader.discover_weather_markets()
 print(f"Discovered US weather markets: {len(markets)}")
 
 # 2. Load whale overlay inputs
-wallets = cfg.get("watched_wallets", [])
-all_pos = []
-for wallet in wallets:
-    if wallet.get("label") in ("ColdMath", "Sharky6999", "RN1"):
-        try:
-            positions = scraper.get_positions(wallet["address"])
-            if positions:
-                all_pos.extend(positions)
-        except Exception:
-            pass
-
+all_pos, whale_wallets_used = load_whale_positions(scraper, cfg)
+print(f"Whale wallets used: {whale_wallets_used}")
 print(f"Whale positions loaded: {len(all_pos)}")
 cycle_report = trader.build_cycle_report(markets, all_pos)
 print(
@@ -58,6 +75,9 @@ for market in markets:
 
 # 4. Mark-to-market and resolve closed positions
 trader.update_prices()
+stopped = trader.apply_risk_stops()
+if stopped:
+    print(f"Risk stops: {len(stopped)} positions")
 resolved = trader.resolve_positions()
 if resolved:
     print(f"Resolved: {resolved} positions")
@@ -78,7 +98,7 @@ if resolved and trader._daily_review_due():
 
 summary = trader.summary()
 print(
-    f"Opened: {opened}, Open: {summary['open_positions']}, "
+    f"Opened: {opened}, Stops: {len(stopped)}, Open: {summary['open_positions']}, "
     f"PnL: ${summary['total_pnl']:.2f}, Exp: ${summary['exposure']:.2f}, Errors: {errors}"
 )
 

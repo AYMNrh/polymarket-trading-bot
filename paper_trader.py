@@ -40,6 +40,8 @@ MAX_SPREAD = 0.08
 MAX_OPEN_POSITIONS = 12
 MAX_CITY_POSITIONS = 2
 EXPERIMENT_DAYS = 3
+STOP_LOSS_PCT = 35.0
+EV_FLIP_EXIT_BUFFER = 0.02
 
 WHALE_BOOST = 0.15
 WHALE_PENALTY = -0.20
@@ -132,6 +134,8 @@ def _load_state() -> dict:
             "kelly_fraction": 0.25,
             "min_volume": MIN_VOLUME,
             "max_spread": MAX_SPREAD,
+            "stop_loss_pct": STOP_LOSS_PCT,
+            "ev_flip_exit_buffer": EV_FLIP_EXIT_BUFFER,
         },
         "experiment": {
             "scope": "us-weather-paper-v1",
@@ -211,7 +215,7 @@ def _extract_market_date(title: str) -> str | None:
         'may': '05', 'june': '06', 'july': '07', 'august': '08',
         'september': '09', 'october': '10', 'november': '11', 'december': '12',
     }
-    year = datetime.now(timezone.utc).yea
+    year = datetime.now(timezone.utc).year
     return f"{year}-{month_map[month_name]}-{day.zfill(2)}"
 
 
@@ -225,6 +229,23 @@ def _market_review_id(position: dict) -> str:
         str(position.get("closed_at") or ""),
     ]
     return "|".join(parts)
+
+
+def _position_pnl_metrics(side: str, shares: float, entry_price: float, current_price: float,
+                          reserved_capital: float | None = None) -> tuple[float, float, float]:
+    """Compute mark-to-market value, pnl, and pnl_pct for an open or closed position."""
+    if side == "SELL":
+        value = shares * (1 - current_price)
+        pnl = shares * (entry_price - current_price)
+        entry_cost = shares * (1 - entry_price)
+    else:
+        value = shares * current_price
+        pnl = value - shares * entry_price
+        entry_cost = shares * entry_price
+
+    capital_base = max(0.01, reserved_capital or entry_cost or 0.01)
+    pnl_pct = (pnl / capital_base) * 100
+    return round(value, 2), round(pnl, 2), round(pnl_pct, 2)
 
 
 class PaperTrader:
@@ -310,6 +331,89 @@ class PaperTrader:
         self.state["last_cycle_report"] = report
         _save_state(self.state)
         return report
+
+    def _risk_exit_reason(self, pos: dict) -> str | None:
+        """Return a stop reason for an open position, or None to keep holding."""
+        params = self.state.get("parameters", {})
+        stop_loss_pct = float(params.get("stop_loss_pct", STOP_LOSS_PCT))
+        ev_flip_exit_buffer = max(
+            float(params.get("ev_flip_exit_buffer", EV_FLIP_EXIT_BUFFER)),
+            float(params.get("min_ev", MIN_EV)) / 2,
+        )
+
+        if pos.get("pnl_pct", 0) <= -stop_loss_pct:
+            return "stop_loss"
+
+        current_price = pos.get("current_price")
+        if current_price is None:
+            return None
+
+        fair_price = self._estimate_fair_price(
+            pos.get("title", "?"),
+            pos.get("market_date"),
+            bucket_low=pos.get("bucket_low"),
+            bucket_high=pos.get("bucket_high"),
+        )
+        if fair_price is None:
+            return None
+
+        current_edge = fair_price - float(current_price)
+        if pos.get("side") == "BUY" and current_edge <= -ev_flip_exit_buffer:
+            return "ev_flip_stop"
+        if pos.get("side") == "SELL" and current_edge >= ev_flip_exit_buffer:
+            return "ev_flip_stop"
+        return None
+
+    def _close_position(self, pos_key: str, pos: dict, exit_price: float | None = None,
+                        close_reason: str = "manual_close") -> dict:
+        """Close a position at a given exit price and release capital back to bankroll."""
+        pos["status"] = "closed"
+        pos["closed_at"] = datetime.now(timezone.utc).isoformat()
+
+        if exit_price is None:
+            exit_price = pos.get("current_price", pos.get("entry_price", 0))
+        exit_price = float(exit_price)
+
+        value, pnl, pnl_pct = _position_pnl_metrics(
+            pos.get("side", "BUY"),
+            float(pos.get("shares", 0)),
+            float(pos.get("entry_price", 0)),
+            exit_price,
+            pos.get("reserved_capital"),
+        )
+        pos["current_price"] = exit_price
+        pos["value"] = value
+        pos["pnl"] = pnl
+        pos["pnl_pct"] = pnl_pct
+        pos["exit_price"] = exit_price
+        pos["close_reason"] = close_reason
+        pos["settlement_value"] = value
+        if close_reason == "resolved":
+            pos["settlement_price"] = exit_price
+        pos["resolved_outcome"] = "win" if pnl >= 0 else "loss"
+
+        self.state["bankroll"] = round(self.state["bankroll"] + value, 2)
+        if pnl >= 0:
+            self.state["wins"] += 1
+        else:
+            self.state["losses"] += 1
+
+        self.state["positions"][pos_key] = pos
+        _log_trade({"action": "CLOSE", **pos})
+        _save_state(self.state)
+        if pos_key in self._open_positions:
+            del self._open_positions[pos_key]
+        logger.info("CLOSE %s via %s: $%.2f PnL", pos.get("title", "?")[:35], close_reason, pnl)
+        return pos
+
+    def apply_risk_stops(self) -> list[dict]:
+        """Close open positions when stop-loss or EV-flip rules trigger."""
+        closed = []
+        for pos_key, pos in list(self._open_positions.items()):
+            reason = self._risk_exit_reason(pos)
+            if reason:
+                closed.append(self._close_position(pos_key, pos, pos.get("current_price"), reason))
+        return closed
 
     def evaluate_and_trade(self, market: dict, whale_positions: list[dict] = None,
                            fair_price: float = None) -> dict | None:
@@ -459,6 +563,7 @@ class PaperTrader:
         slug = self._make_slug(title, direction)
         entry = {
             "event_slug": slug,
+            "polymarket_slug": market.get("slug", ""),
             "market_id": market_id,
             "condition_id": condition_id,
             "title": title[:100],
@@ -499,13 +604,16 @@ class PaperTrader:
         if existing_key:
             pos = self._open_positions[existing_key]
             pos["current_price"] = price
-            if pos.get('side') == 'SELL':
-                pos['value'] = round(pos['shares'] * (1 - price), 2)
-                pos['pnl'] = round(pos['shares'] * (pos['entry_price'] - price), 2)
-            else:
-                pos['value'] = round(pos['shares'] * price, 2)
-                pos['pnl'] = round(pos['value'] - pos['shares'] * pos['entry_price'], 2)
-            pos["pnl_pct"] = round((price - pos["entry_price"]) / max(0.001, pos["entry_price"]) * 100, 2)
+            value, pnl, pnl_pct = _position_pnl_metrics(
+                pos.get('side', 'BUY'),
+                float(pos.get('shares', 0)),
+                float(pos.get('entry_price', 0)),
+                float(price),
+                pos.get('reserved_capital'),
+            )
+            pos['value'] = value
+            pos['pnl'] = pnl
+            pos["pnl_pct"] = pnl_pct
             self.state["positions"][existing_key] = pos
             _log_trade({"action": "UPDATE", **pos})
             _save_state(self.state)
@@ -551,37 +659,7 @@ class PaperTrader:
 
         if not pos:
             return
-
-        pos["status"] = "closed"
-        pos["closed_at"] = datetime.now(timezone.utc).isoformat()
-        if resolved_price is not None:
-            pos["settlement_price"] = resolved_price
-            if pos.get("side") == "SELL":
-                pnl = (pos["entry_price"] - resolved_price) * pos["shares"]
-                settlement_value = (1 - resolved_price) * pos["shares"]
-            else:
-                pnl = (resolved_price - pos["entry_price"]) * pos["shares"]
-                settlement_value = resolved_price * pos["shares"]
-            pos["pnl"] = round(pnl, 2)
-            pos["exit_price"] = resolved_price
-            pos["close_reason"] = "resolved"
-            pos["settlement_value"] = round(settlement_value, 2)
-            pos["resolved_outcome"] = "win" if pnl >= 0 else "loss"
-
-        bankroll_credit = pos.get("settlement_value")
-        if bankroll_credit is None:
-            bankroll_credit = pos.get("reserved_capital", 0) + pos.get("pnl", 0)
-        self.state["bankroll"] = round(self.state["bankroll"] + bankroll_credit, 2)
-        if pos.get("pnl", 0) >= 0:
-            self.state["wins"] += 1
-        else:
-            self.state["losses"] += 1
-        _log_trade({"action": "CLOSE", **pos})
-        _save_state(self.state)
-        # Remove from open positions
-        if pos_key and pos_key in self._open_positions:
-            del self._open_positions[pos_key]
-        logger.info("CLOSE %s: $%.2f PnL", (market_title or condition_id or "?")[:35], pos.get("pnl", 0))
+        return self._close_position(pos_key, pos, resolved_price, "resolved")
 
     def _check_whale_overlay(self, title: str, direction: str,
                               whale_positions: list[dict]) -> dict:
@@ -821,12 +899,16 @@ class PaperTrader:
                 prices = json.loads(prices_str)
                 price = float(prices[0])
                 pos['current_price'] = price
-                if pos.get('side') == 'SELL':
-                    pos['value'] = round(pos['shares'] * (1 - price), 2)
-                    pos['pnl'] = round(pos['shares'] * (pos['entry_price'] - price), 2)
-                else:
-                    pos['value'] = round(pos['shares'] * price, 2)
-                    pos['pnl'] = round(pos['value'] - pos['shares'] * pos['entry_price'], 2)
+                value, pnl, pnl_pct = _position_pnl_metrics(
+                    pos.get('side', 'BUY'),
+                    float(pos.get('shares', 0)),
+                    float(pos.get('entry_price', 0)),
+                    price,
+                    pos.get('reserved_capital'),
+                )
+                pos['value'] = value
+                pos['pnl'] = pnl
+                pos['pnl_pct'] = pnl_pct
             except Exception:
                 pass
         _save_state(self.state)
