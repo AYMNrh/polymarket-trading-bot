@@ -180,6 +180,44 @@ class PaperTrader:
         title = market.get("question", "?")
         condition_id = market.get("conditionId", "")
         market_id = market.get("id", "")
+
+        # --- Self-learning: extract temp range from title ---
+        bucket_low, bucket_high = 0.0, 0.0
+        temp_match = re.findall(r'(\d+)\s*[°F]', title)
+        if len(temp_match) >= 2:
+            bucket_low = float(temp_match[-2])
+            bucket_high = float(temp_match[-1])
+        elif len(temp_match) == 1:
+            bucket_low = bucket_high = float(temp_match[0])
+        if 'or below' in title.lower():
+            bucket_low, bucket_high = -999.0, bucket_low or bucket_high or 0
+        if 'or higher' in title.lower() or 'or above' in title.lower():
+            bucket_low, bucket_high = bucket_low or 0, 999.0
+
+        # --- Pre-compute forecast temp (shared with _estimate_fair_price) ---
+        forecast_temp = None
+        date_str_forecast = None
+        title_lower = title.lower()
+        for cn in FORECAST_LOCATIONS:
+            if cn.lower() in title_lower:
+                date_match = re.search(r'(may|april|june|july|august|september|october)\s+(\d+)', title_lower)
+                if date_match:
+                    month_name = date_match.group(1)
+                    day = date_match.group(2)
+                    month_map = {'may':'05','april':'04','june':'06','july':'07','august':'08','september':'09','october':'10'}
+                    date_str_forecast = f"2026-{month_map.get(month_name,'05')}-{day.zfill(2)}"
+                else:
+                    date_str_forecast = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")
+                unit = FORECAST_LOCATIONS[cn]['unit']
+                forecast_temp = _get_forecast_temp(cn, date_str_forecast, unit)
+                break
+
+        # --- Learned parameters override ---
+        params = self.state.get('parameters', {})
+        current_min_ev = params.get('min_ev', EV_THRESHOLD)
+        current_max_bet = params.get('max_bet', MAX_BET)
+        current_max_price = params.get('max_price', 0.45)
+
         best_bid = market.get("bestBid")
         best_ask = market.get("bestAsk")
         outcome_prices = market.get("outcomePrices", "[]")
@@ -201,15 +239,19 @@ class PaperTrader:
         if spread > 0.10:
             return None
 
+        # Max price check from learned parameters
+        if price >= current_max_price:
+            return None
+
         # Default fair price if not provided
         if fair_price is None:
-            fair_price = self._estimate_fair_price(title)
+            fair_price = self._estimate_fair_price(title, date_str_forecast, forecast_temp)
         if fair_price is None or fair_price <= 0 or fair_price >= 1:
             return None
 
         # Compute EV
         ev = fair_price - price
-        if abs(ev) < EV_THRESHOLD:
+        if abs(ev) < current_min_ev:
             return None
 
         direction = "BUY" if ev > 0 else "SELL"
@@ -227,7 +269,7 @@ class PaperTrader:
         kelly_raw = _kelly_fraction(fair_price, price) if direction == "BUY" else _kelly_fraction(1-fair_price, 1-price)
         kelly_adjusted = kelly_raw * (1.0 + whale_overlay["size_boost"])
         allocation = _kelly_size(kelly_adjusted * 0.25, self.state["bankroll"])
-        allocation = min(allocation, MAX_BET)
+        allocation = min(allocation, current_max_bet)
 
         # Cap exposure at 50% of bankroll and max 15 positions
         current_exposure = sum(p.get("value", 0) for p in self._open_positions.values())
@@ -270,6 +312,10 @@ class PaperTrader:
             "kelly_fraction": round(kelly_adjusted * 0.25, 4),
             "entry_ts": datetime.now(timezone.utc).isoformat(),
             "status": "open",
+            "bucket_low": bucket_low,
+            "bucket_high": bucket_high,
+            "forecast_temp": forecast_temp,
+            "forecast_source": "ecmwf",
         }
 
         # Dedup by condition_id first
@@ -345,6 +391,7 @@ class PaperTrader:
             else:
                 pnl = (resolved_price - pos["entry_price"]) * pos["shares"]
             pos["pnl"] = round(pnl, 2)
+            pos["resolved_outcome"] = "win" if pnl >= 0 else "loss"
 
         self.state["bankroll"] += pos.get("pnl", 0)
         if pos.get("pnl", 0) >= 0:
@@ -459,8 +506,9 @@ class PaperTrader:
 
         return markets
 
-    def _estimate_fair_price(self, title: str, date_str: str = None) -> Optional[float]:
-        """Estimate fair price from real Open-Meteo ECMWF weather forecasts."""
+    def _estimate_fair_price(self, title: str, date_str: str = None, forecast_temp: float = None) -> Optional[float]:
+        """Estimate fair price from real Open-Meteo ECMWF weather forecasts.
+        If forecast_temp is provided, skips the API call."""
         title_lower = title.lower()
         city = None
         for city_name in FORECAST_LOCATIONS:
@@ -490,7 +538,8 @@ class PaperTrader:
             return None
 
         unit = loc["unit"]
-        forecast_temp = _get_forecast_temp(city, date_str, unit)
+        if forecast_temp is None:
+            forecast_temp = _get_forecast_temp(city, date_str, unit)
         if forecast_temp is None:
             return None
         if temp is None:
@@ -562,6 +611,99 @@ class PaperTrader:
             except Exception:
                 pass
         _save_state(self.state)
+
+    def _get_actual_temp(self, city, date_str, unit='F'):
+        """Get actual temperature from Open-Meteo ERA5 reanalysis (free, no key)."""
+        loc = FORECAST_LOCATIONS.get(city)
+        if not loc: return None
+        temp_unit = 'fahrenheit' if unit == 'F' else 'celsius'
+        url = (f'https://archive-api.open-meteo.com/v1/archive'
+               f'?latitude={loc["lat"]}&longitude={loc["lon"]}'
+               f'&start_date={date_str}&end_date={date_str}'
+               f'&daily=temperature_2m_max&temperature_unit={temp_unit}')
+        try:
+            data = requests.get(url, timeout=8).json()
+            if 'daily' in data:
+                temps = data['daily'].get('temperature_2m_max', [])
+                if temps and temps[0] is not None:
+                    return round(temps[0]) if unit == 'F' else round(temps[0], 1)
+        except Exception:
+            pass
+        return None
+
+    def export_for_learning(self) -> list[dict]:
+        """Export recently closed positions in self_learning format."""
+        closed = self.get_closed_positions(50)
+        result = []
+        for p in closed:
+            city = None
+            for cn in FORECAST_LOCATIONS:
+                if cn.lower() in p.get('title','').lower():
+                    city = cn
+                    break
+
+            # Build forecast snapshot in the format self_learning expects
+            forecast_snapshot = {
+                'ts': p.get('closed_at', ''),
+                'best_source': p.get('forecast_source', 'ecmwf'),
+                'source': p.get('forecast_source', 'ecmwf'),
+                'best': p.get('forecast_temp'),
+                'temp': p.get('forecast_temp'),
+            }
+
+            # Get actual temp from ERA5
+            date_str = None
+            import re as _re
+            date_match = _re.search(r'(\d{4}-\d{2}-\d{2})', p.get('event_slug',''))
+            if date_match:
+                date_str = date_match.group(1)
+            elif p.get('closed_at'):
+                date_str = p['closed_at'][:10]
+
+            actual_temp = None
+            if city and date_str:
+                unit = FORECAST_LOCATIONS[city]['unit']
+                actual_temp = self._get_actual_temp(city, date_str, unit)
+
+            result.append({
+                'city': city or '',
+                'city_name': city or '',
+                'date': date_str or '',
+                'unit': FORECAST_LOCATIONS.get(city,{}).get('unit','F'),
+                'status': 'resolved',
+                'resolved_outcome': p.get('resolved_outcome', 'loss'),
+                'pnl': p.get('pnl', 0),
+                't_low': p.get('bucket_low', 0),
+                't_high': p.get('bucket_high', 0),
+                'forecast_snapshots': [forecast_snapshot] if forecast_snapshot['best'] else [],
+                'actual_temp': actual_temp,
+                'market_snapshots': [{'entry_price': p.get('entry_price', 0)}],
+                'position': {
+                    'entry_price': p.get('entry_price', 0),
+                    'exit_price': p.get('exit_price'),
+                    'pnl': p.get('pnl', 0),
+                    'status': 'closed',
+                    'close_reason': p.get('close_reason', ''),
+                },
+            })
+        return result
+
+    def apply_learned_parameters(self):
+        """Apply parameters learned by self_learning engine."""
+        notes_file = Path(__file__).parent / "data" / "strategy_notes.json"
+        if not notes_file.exists():
+            return {}
+        try:
+            notes = json.loads(notes_file.read_text())
+            learned = notes.get('parameter_adjustments', {})
+            if learned:
+                self.state.setdefault('parameters', {}).update(learned)
+                _save_state(self.state)
+                logger.info(f'Applied learned parameters: {learned}')
+                return learned
+        except Exception:
+            pass
+        return {}
 
     def summary(self) -> dict:
         """Get current portfolio summary."""

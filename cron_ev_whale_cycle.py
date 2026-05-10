@@ -50,8 +50,27 @@ resolved = trader.resolve_positions()
 if resolved:
     print(f'Resolved: {resolved} positions')
 
+# 5. Self-learning: review resolved trades and adjust parameters
+if resolved:
+    from self_learning import SelfLearningEngine
+    learner = SelfLearningEngine()
+    
+    # Export closed positions in self-learning format
+    learning_data = trader.export_for_learning()
+    if learning_data:
+        observations = learner.review_resolved_trades(learning_data)
+        if observations:
+            print(f'Self-learning: {len(observations)} insights generated')
+            for obs in observations[:5]:
+                print(f'  {obs[:80]}')
+    
+    # Apply learned parameters back to trading engine
+    applied = trader.apply_learned_parameters()
+    if applied:
+        print(f'Parameters updated: {applied}')
+
 s = trader.summary()
 print(f'Opened: {opened}, Open: {s["open_positions"]}, PnL: ${s["total_pnl"]:.2f}, Exp: ${s["exposure"]:.2f}')
 
-# 5. Persist state
+# 6. Persist state
 _save_state(trader.state)
