@@ -1,0 +1,27 @@
+# Polymarket paper trading data
+data/paper_portfolio.json
+data/paper_trades.jsonl
+data/strategy_notes.json
+data/parameter_adjustments.jsonl
+data/orderbook_cache.json
+data/whale_portfolios.json
+data/_hb*.py
+
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# Logs and temp
+*.log
+*.tmp
+*_backup_*
+.cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
