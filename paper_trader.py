@@ -42,6 +42,9 @@ MAX_CITY_POSITIONS = 2
 EXPERIMENT_DAYS = 3
 STOP_LOSS_PCT = 35.0
 EV_FLIP_EXIT_BUFFER = 0.02
+TAKE_PROFIT_PCT = 150.0
+TAKE_PROFIT_MAX_REMAINING_EDGE = 0.02
+HARD_TAKE_PROFIT_PCT = 500.0
 
 WHALE_BOOST = 0.15
 WHALE_PENALTY = -0.20
@@ -136,6 +139,9 @@ def _load_state() -> dict:
             "max_spread": MAX_SPREAD,
             "stop_loss_pct": STOP_LOSS_PCT,
             "ev_flip_exit_buffer": EV_FLIP_EXIT_BUFFER,
+            "take_profit_pct": TAKE_PROFIT_PCT,
+            "take_profit_max_remaining_edge": TAKE_PROFIT_MAX_REMAINING_EDGE,
+            "hard_take_profit_pct": HARD_TAKE_PROFIT_PCT,
         },
         "experiment": {
             "scope": "us-weather-paper-v1",
@@ -254,6 +260,12 @@ class PaperTrader:
 
     def __init__(self, bankroll: float = None):
         self.state = _load_state()
+        self.state.setdefault("parameters", {})
+        self.state["parameters"].setdefault("stop_loss_pct", STOP_LOSS_PCT)
+        self.state["parameters"].setdefault("ev_flip_exit_buffer", EV_FLIP_EXIT_BUFFER)
+        self.state["parameters"].setdefault("take_profit_pct", TAKE_PROFIT_PCT)
+        self.state["parameters"].setdefault("take_profit_max_remaining_edge", TAKE_PROFIT_MAX_REMAINING_EDGE)
+        self.state["parameters"].setdefault("hard_take_profit_pct", HARD_TAKE_PROFIT_PCT)
         if bankroll is not None:
             self.state["bankroll"] = bankroll
             self.state["starting_bankroll"] = bankroll
@@ -340,9 +352,17 @@ class PaperTrader:
             float(params.get("ev_flip_exit_buffer", EV_FLIP_EXIT_BUFFER)),
             float(params.get("min_ev", MIN_EV)) / 2,
         )
+        take_profit_pct = float(params.get("take_profit_pct", TAKE_PROFIT_PCT))
+        hard_take_profit_pct = float(params.get("hard_take_profit_pct", HARD_TAKE_PROFIT_PCT))
+        take_profit_max_remaining_edge = max(
+            float(params.get("take_profit_max_remaining_edge", TAKE_PROFIT_MAX_REMAINING_EDGE)),
+            float(params.get("min_ev", MIN_EV)) / 2,
+        )
 
         if pos.get("pnl_pct", 0) <= -stop_loss_pct:
             return "stop_loss"
+        if pos.get("pnl_pct", 0) >= hard_take_profit_pct:
+            return "hard_take_profit"
 
         current_price = pos.get("current_price")
         if current_price is None:
@@ -358,6 +378,11 @@ class PaperTrader:
             return None
 
         current_edge = fair_price - float(current_price)
+        if (
+            pos.get("pnl_pct", 0) >= take_profit_pct
+            and abs(current_edge) <= take_profit_max_remaining_edge
+        ):
+            return "take_profit"
         if pos.get("side") == "BUY" and current_edge <= -ev_flip_exit_buffer:
             return "ev_flip_stop"
         if pos.get("side") == "SELL" and current_edge >= ev_flip_exit_buffer:
