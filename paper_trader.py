@@ -53,7 +53,7 @@ TRAILING_STOP_PCT = 45.0
 MIN_EDGE_FLOOR = 0.05  # lowered from 0.08 — tighter edge exhaustion tolerance
 MAX_POSITION_DAYS = 3
 # ─── V6 Tail Experiment Constants ──────────────────────────────────────────
-TAIL_EXP_TRADES_LIMIT = 50         # v6.1: run for 50 trades then compare
+TAIL_EXP_TRADES_LIMIT: int | None = None  # continuous mode; risk limits still cap exposure
 TAIL_EXP_ENTRY_MAX = 0.01         # v6.1: raised from $0.005 to unlock more tradeable markets
 TAIL_EXP_HARD_SKIP_PRICE = 0.015  # skip $0.015+ (was $0.006, aligned with entry_max raise)
 TAIL_EXP_FIXED_ALLOCATION = 2.0   # $1-$2 per trade default
@@ -1024,9 +1024,9 @@ class PaperTrader:
             # V6.1: Suspicious volume check — $0.001 markets with volume <$25 may have fake MFE
             if price <= 0.001 and volume < TAIL_EXP_SUSPICIOUS_VOLUME:
                 return None
-            # Check trade limit — hard stop at 100
+            # Optional trade limit; continuous mode leaves this unset.
             total_trades = self.state.get("total_trades", 0)
-            if total_trades >= TAIL_EXP_TRADES_LIMIT:
+            if TAIL_EXP_TRADES_LIMIT is not None and total_trades >= TAIL_EXP_TRADES_LIMIT:
                 logger.info("Tail experiment: hit %d trade limit, stopping", TAIL_EXP_TRADES_LIMIT)
                 return None
 

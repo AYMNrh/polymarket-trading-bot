@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Tail experiment cron: runs PaperTrader in tail-experiment mode, every 5m.
-Auto-stops at 100 trades — check tail_experiment_portfolio.json for state."""
+"""Tail experiment cron: runs PaperTrader in tail-experiment mode, every 5m."""
 
 import logging
 import sys
@@ -16,13 +15,8 @@ config = load_config()
 
 trader = PaperTrader(mode='tail-experiment')
 
-# Check if we've hit the trade limit
 total_trades = trader.state.get("total_trades", 0)
-if total_trades >= 50:
-    print(f"TAIL_EXP_DONE: {total_trades} trades completed (limit 50)")
-    sys.exit(0)
-
-print(f"Tail experiment v6.1: {total_trades}/50 trades")
+print(f"Tail experiment v6.1 continuous: {total_trades} trades")
 
 # Discover weather markets using PaperTrader's built-in method
 markets = trader.discover_weather_markets()
@@ -63,7 +57,3 @@ trader.update_prices()
 
 print(f"  Opened: {trades_opened}, Closed: {len(closed)}")
 print(f"  Bankroll: ${trader.state['bankroll']:.2f}, Open: {len(trader._open_positions)}")
-
-total_trades = trader.state.get("total_trades", 0)
-if total_trades >= 100:
-    print(f"TAIL_EXP_DONE: Hit 50 trade limit")
