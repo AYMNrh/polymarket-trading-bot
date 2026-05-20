@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import logging, json, sys
 logging.basicConfig(level=logging.WARNING, stream=sys.stdout)
 
@@ -8,7 +7,7 @@ from config import load_config
 
 cfg = load_config()
 scraper = PolymarketScraper()
-trader = PaperTrader(bankroll=100.0)
+trader = PaperTrader()
 
 # 1. Discover weather markets via event slugs (proven approach)
 markets = trader.discover_weather_markets()
@@ -39,3 +38,10 @@ for m in markets:
 
 s = trader.summary()
 print(f'Opened: {opened}, Open: {s["open_positions"]}, PnL: ${s["total_pnl"]:.2f}, Exp: ${s["exposure"]:.2f}')
+
+# Also dump detailed positions
+pos = trader.get_positions()
+if pos:
+    print(f'\nDetailed positions ({len(pos)}):')
+    for p in pos:
+        print(f'  {p["market"].get("question","?")[:50]:50s} | qty={p["quantity"]:5.2f} | entry=${p["entry_price"]:.3f} | curr=${p["current_price"]:.3f} | pnl=${p["unrealized_pnl"]:+.2f}')

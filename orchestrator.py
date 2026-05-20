@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 from config import load_config, save_config
 from database import (
-    save_trade, save_whale, save_signal, get_stats,
+    save_trade, save_whale, mark_signals_acted, save_signal, get_stats,
     get_recent_trades, get_whale_summary,
 )
 from whale_tracker import WhaleTracker
@@ -81,6 +81,7 @@ class WhaleOrchestrator:
                 "details": {"count": new_count},
                 "confidence": 0.9,
             })
+            mark_signals_acted(signal_type="NEW_WHALE_DISCOVERY")
 
         return new_count
 

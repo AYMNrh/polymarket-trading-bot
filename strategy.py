@@ -30,7 +30,7 @@ _FORECAST_CACHE = {}  # key: (city_slug, date_str) -> dict with temp, sigma, ts
 CITY_COORDS = {
     "new-york":         (40.7128, -74.0060),
     "chicago":          (41.8781, -87.6298),
-    "los-angeles":      (34.0522, -118.2437),
+    # "los-angeles": removed — 30% WR, -$6.10 in paper trading
     "miami":            (25.7617, -80.1918),
     "houston":          (29.7604, -95.3698),
     "phoenix":          (33.4484, -112.0740),
@@ -61,7 +61,8 @@ from orderbook_analyzer import analyze_order_book, OrderBookSignal, order_book_t
 
 # Weather cities to monitor (expandable)
 WEATHER_CITIES = [
-    "new-york", "chicago", "los-angeles", "miami", "houston",
+    "new-york", "chicago", "miami", "houston",
+    # "los-angeles" removed: 30% WR, -$6.10
     "phoenix", "denver", "seattle", "boston", "dallas",
     "san-francisco", "washington-dc", "philadelphia", "atlanta",
     "london", "tokyo", "paris", "berlin", "sydney",
@@ -427,10 +428,10 @@ class StrategyEngine:
         fcst_temp = forecast["temp_max_f"]
         sigma = forecast.get("sigma", FORECAST_SIGMA_F)
 
-        # Probability actual temp > threshold = 1 - CDF(threshold)
+        # Probability actual temp > threshold.
         # This is the fair price for the YES side
         z = (fcst_temp - temp) / sigma
-        fair = round(1.0 - _norm_cdf(z), 3)
+        fair = round(_norm_cdf(z), 3)
 
         logger.debug(
             "  🌡 %s forecast=%.0f°F  threshold=%d°F  sigma=%.1f  →  fair=%.3f",

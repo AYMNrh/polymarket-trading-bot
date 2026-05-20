@@ -1,4 +1,5 @@
 import logging, json, sys
+
 logging.basicConfig(level=logging.WARNING, stream=sys.stdout)
 
 from polymarket_scraper import PolymarketScraper
@@ -7,7 +8,7 @@ from config import load_config
 
 cfg = load_config()
 scraper = PolymarketScraper()
-trader = PaperTrader(bankroll=100.0)
+trader = PaperTrader()
 
 # 1. Discover weather markets via event slugs (proven approach)
 markets = trader.discover_weather_markets()

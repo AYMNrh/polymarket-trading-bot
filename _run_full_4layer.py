@@ -72,13 +72,13 @@ if portfolio:
     total_cap = sum(abs(p.get("size", 0) * p.get("entry_price", 0)) for p in portfolio)
     print(f"Total capital deployed: ${total_cap:.2f}")
     print()
-    print(f"  {City:20s} {Dir:4s} {Entry:>8s} {EV:>7s} {Conf:>4s} {Wall:>5s} {Spread:>7s}")
+    print(f"  {'City':20s} {'Dir':4s} {'Entry':>8s} {'EV':>7s} {'Conf':>4s} {'Wall':>5s} {'Spread':>7s}")
     print(f"  {'-'*20} {'-'*4} {'-'*8} {'-'*7} {'-'*4} {'-'*5} {'-'*7}")
     for p in portfolio[:10]:
         ob = p.get("order_book", {}) or {}
         ws = ob.get("wall_score", 0)
         sp = ob.get("spread", 0)
-        print(f"   p['city']:20s} p['direction']:4s} ${p['entry_price']:.4f}  {p['expected_value']:+.4f}  {p['confidence']*100:.0f}%  {ws:+.2f}  {sp:.4f}")
+        print(f"  {p['city']:20s} {p['direction']:4s} ${p['entry_price']:.4f}  {p['expected_value']:+.4f}  {p['confidence']*100:.0f}%  {ws:+.2f}  {sp:.4f}")
 
 # LAYER 4
 print()

@@ -3,7 +3,9 @@
 import requests, json, sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-key = 'T35WYX45NH88EENSM71UVNJAZQQDG3Z29I'
+key = os.getenv("POLYGONSCAN_API_KEY", "")
+if not key:
+    raise SystemExit("POLYGONSCAN_API_KEY is required")
 
 # Get a ColdMath USDC->CTF transaction from our database
 from etherscan_client import EtherscanV2Client

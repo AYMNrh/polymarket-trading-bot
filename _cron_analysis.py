@@ -20,7 +20,7 @@ if markets:
     
     if portfolio:
         print()
-        for p in portfolio[:15]:
+        for p in portfolio[:10]:
             ob = p.get('order_book', {}) or {}
             ws = ob.get('wall_score', 0)
             sp = ob.get('spread', 0)
@@ -30,7 +30,6 @@ if markets:
     
     # Conviction summary
     print()
-    summary = orch.tracker.position_tracker.summary()
-    print(summary)
+    print(orch.tracker.position_tracker.summary())
 else:
     print('No weather markets found.')

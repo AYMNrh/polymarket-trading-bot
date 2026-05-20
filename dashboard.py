@@ -6,8 +6,10 @@ Run with: uvicorn dashboard:app --reload --port 9091
 """
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote_plus
 
 try:
     from fastapi import FastAPI, Request
@@ -31,9 +33,9 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Whale Tracker Dashboard")
 tracker = PositionTracker()
 learner = SelfLearningEngine()
-decoder = OnChainTradeDecoder(etherscan_key="T35WYX45NH88EENSM71UVNJAZQQDG3Z29I")
+decoder = OnChainTradeDecoder(etherscan_key=os.getenv("POLYGONSCAN_API_KEY", ""))
 scraper = PolymarketScraper()
-paper_trader = PaperTrader(bankroll=100.0)
+paper_trader = PaperTrader()
 
 LOG_FILE = Path(__file__).parent / "whale_trades.jsonl"
 ORDERBOOK_CACHE = Path(__file__).parent / "data" / "orderbook_cache.json"
@@ -113,10 +115,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         <div class="nav">
             <a href="/" class="active">Dashboard</a>
-            <a href="/?view=orderbook">Order Books</a>
-            <a href="/?view=conviction">Conviction</a>
-            <a href="/?view=strategy">Strategy Report</a>
-            <a href="/?view=trades">Whale Trades</a>
+            <a href="/?view=candidates">Whale Candidates</a>
             <a href="/?view=paper">Paper Portfolio</a>
         </div>
 
@@ -184,7 +183,16 @@ def _render_dashboard() -> str:
     stats["positions"] = len(positions_data)
     stats["high_conviction"] = len(conviction_data)
 
-    # Whales table — enrich with scraper portfolio data
+    # Cycle/experiment stats (used in template f-strings below)
+    cycle = {"discovered_markets": 0, "liquid_candidates": 0,
+             "ev_candidates": 0, "tradable_candidates": 0}
+    experiment = {"scope": "paper-v1", "duration_days": 3}
+    summary = stats.copy()
+    summary["last_learning_review_date"] = None
+
+    from database import get_whale_profile
+
+    # Whales table — enrich with cached Polymarket profile data from DB
     whale_rows = ""
     for w in whales[:15]:
         wr = w.get("win_rate")
@@ -192,21 +200,30 @@ def _render_dashboard() -> str:
         addr = w["address"]
         label = w.get("label", "?")
 
-        # Try scraper for live portfolio value
-        try:
-            profile = scraper.get_profile(addr)
-            live_pv = profile.get("portfolio_value")
-            live_pnl = profile.get("total_pnl")
-        except Exception:
-            live_pv = None
-            live_pnl = None
+        # Load enriched profile from DB (populated by enrich_whales cron)
+        profile_data = get_whale_profile(addr)
+        if profile_data:
+            summary = profile_data.get("summary", {})
+            live_pv = summary.get("portfolio_value") or summary.get("value") or None
+            live_pnl = summary.get("total_pnl") or None
+        else:
+            # Fallback: live scrape (slow)
+            try:
+                profile = scraper.get_profile(addr)
+                live_pv = profile.get("portfolio_value")
+                live_pnl = profile.get("total_pnl")
+            except Exception:
+                live_pv = None
+                live_pnl = None
 
         pv_str = f"${live_pv:,.0f}" if live_pv else "—"
         pnl_str = f"+${live_pnl:,.0f}" if (live_pnl and live_pnl > 0) else (f"${live_pnl:,.0f}" if live_pnl else "—")
+        pm_link = f"https://polymarket.com/profile/{addr}"
         whale_rows += (
             f"<tr>"
             f"<td>{label}</td>"
-            f"<td style='font-family:mono;font-size:0.8em'>{addr[:10]}...{addr[-6:]}</td>"
+            f"<td style='font-family:mono;font-size:0.8em'>"
+            f"<a href='{pm_link}' target='_blank' style='color:#64b5f6;text-decoration:none' title='View on Polymarket'>{addr[:10]}...{addr[-6:]} &#8599;</a></td>"
             f"<td>${w.get('volume', 0):.0f}</td>"
             f"<td>{w.get('trades_tracked', w.get('total_trades', 0))}</td>"
             f"<td>{pv_str}</td>"
@@ -708,9 +725,13 @@ def _render_whale_trades(selected_addr: str = "") -> str:
     # Count of live decoded events
     decoded_count = len(live)
 
-    main = f"""
-        <div class="section">
-            <h2>🐋 Whale Trades</h2>
+    main = f"""\r
+        <div class="section">\r
+            <h2>🐋 Whale Trades\r
+                <a href="https://polymarket.com/profile/{selected_addr}" target="_blank"\r
+                   style="font-size:0.6em;color:#64b5f6;text-decoration:none;margin-left:12px;background:#14141f;padding:4px 12px;border-radius:6px;border:1px solid #1e1e2e">\r
+                   View on Polymarket ↗</a>\r
+            </h2>\r
             <div style="margin-bottom:16px">
                 <label for="whale-select" style="color:#888;font-size:0.9em;margin-right:8px">Select whale:</label>
                 <select id="whale-select" onchange="window.location.href='/?view=trades&wallet='+this.value"
@@ -839,16 +860,24 @@ def _render_paper_portfolio() -> str:
         pnl_cls = "positive" if pnl >= 0 else "negative"
         direction = p.get("side", "?")
         side_cls = "buy" if direction == "BUY" else "sell"
-        title = str(p.get("title", "?"))[:65]
+        title_full = str(p.get("title", "?"))
+        title = title_full[:65]
         ev = p.get("ev", 0)
         confidence = p.get("confidence", 0)
         whale_align = p.get("whale_aligned", False)
         whale_badge = ' <span class="badge badge-conviction">🐋</span>' if whale_align else ""
+        market_slug = p.get("polymarket_slug") or p.get("slug") or ""
+        market_url = (
+            f"https://polymarket.com/event/{market_slug}"
+            if market_slug
+            else f"https://polymarket.com/search?q={quote_plus(title_full)}"
+        )
 
         rows += (
             f"<tr>"
             f"<td class='{side_cls}'>{direction}</td>"
-            f"<td>{title}...{whale_badge}</td>"
+            f"<td><a href='{market_url}' target='_blank' style='color:#64b5f6;text-decoration:none' "
+            f"title='{title_full}'>{title}...</a>{whale_badge}</td>"
             f"<td>${p.get('value', 0):.2f}</td>"
             f"<td class='{pnl_cls}'>${pnl:.2f}</td>"
             f"<td class='{pnl_cls}'>{p.get('pnl_pct', 0):+.1f}%</td>"
@@ -864,8 +893,16 @@ def _render_paper_portfolio() -> str:
     for p in closed[:5]:
         pnl = p.get("pnl", 0)
         pnl_cls = "positive" if pnl >= 0 else "negative"
+        title_full = str(p.get('title', '?'))
+        market_slug = p.get("polymarket_slug") or p.get("slug") or ""
+        market_url = (
+            f"https://polymarket.com/event/{market_slug}"
+            if market_slug
+            else f"https://polymarket.com/search?q={quote_plus(title_full)}"
+        )
         closed_rows += (
-            f"<tr><td>{str(p.get('title','?'))[:50]}...</td>"
+            f"<tr><td><a href='{market_url}' target='_blank' style='color:#64b5f6;text-decoration:none' "
+            f"title='{title_full}'>{title_full[:50]}...</a></td>"
             f"<td class='{pnl_cls}'>${pnl:.2f}</td>"
             f"<td>{p.get('closed_at','?')[:16]}</td></tr>"
         )
@@ -932,21 +969,89 @@ def _render_paper_portfolio() -> str:
     )
 
 
+def _render_whale_candidates() -> str:
+    """Render whale candidates discovery page."""
+    from database import get_whale_candidates
+    candidates = get_whale_candidates()
+
+    rows = ""
+    for c in candidates:
+        tier = c.get("tier", "NOISE")
+        tier_color = "#00d4aa" if tier == "QUALITY" else "#ffd700" if tier == "POTENTIAL" else "#888"
+        pnl = c.get("total_pnl", 0) or 0
+        pnl_color = "#00d4aa" if pnl > 0 else "#ff6b6b"
+        entry = c.get("avg_entry", 0.5) or 0.5
+        entry_note = "⚠️ WASHER" if entry >= 0.85 else ""
+        weather = c.get("weather_positions", 0) or 0
+        label = c.get("label", "?")
+        addr = c.get("address", "?")[:10]
+        pm_link = f"https://polymarket.com/profile/{c.get('address', '')}"
+
+        rows += (
+            f"<tr>"
+            f"<td><span style='color:{tier_color}'>{tier}</span></td>"
+            f"<td>{label}</td>"
+            f"<td style='font-family:mono;font-size:0.8em'>"
+            f"<a href='{pm_link}' target='_blank' style='color:#64b5f6;text-decoration:none'>{addr}... &#8599;</a></td>"
+            f"<td style='color:{pnl_color}'>${pnl:,.0f}</td>"
+            f"<td>{c.get('trades', 0):,d}</td>"
+            f"<td>${entry:.3f} {entry_note}</td>"
+            f"<td>{c.get('entry_style', '?')}</td>"
+            f"<td>{weather}</td>"
+            f"<td>{c.get('score', 0):.3f}</td>"
+            f"</tr>"
+        )
+
+    quality_count = sum(1 for c in candidates if c.get("tier") == "QUALITY")
+    potential_count = sum(1 for c in candidates if c.get("tier") == "POTENTIAL")
+
+    main = f"""
+    <h2>🐋 Whale Candidates</h2>
+    <div class="stats">
+        <div class="stat-card">
+            <div class="value">{quality_count}</div>
+            <div class="label">Quality</div>
+        </div>
+        <div class="stat-card">
+            <div class="value">{potential_count}</div>
+            <div class="label">Potential</div>
+        </div>
+        <div class="stat-card">
+            <div class="value">{len(candidates)}</div>
+            <div class="label">Total Candidates</div>
+        </div>
+    </div>
+    <p style="color:#666;margin-bottom:16px">
+        From <code>discover_whales.py</code> — wallets with positive PnL and reasonable entry prices.
+        Quality = scored &ge;0.6 with avg entry &lt;$0.85. Run <code>python3 discover_whales.py --add-quality</code>
+        to add quality candidates to the watch list.
+    </p>
+    <table>
+        <tr>
+            <th>Tier</th><th>Label</th><th>Address</th><th>PnL</th>
+            <th>Trades</th><th>Avg Entry</th><th>Style</th><th>Weather</th><th>Score</th>
+        </tr>
+        {rows}
+    </table>
+    """
+
+    return HTML_TEMPLATE.format(
+        whales="—", trades="—", volume=0, signals="—",
+        today_trades="—", today_volume=0,
+        positions="—", high_conviction="—",
+        main_content=main,
+        now=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
+
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
     view = request.query_params.get("view", "dashboard")
 
-    if view == "orderbook":
-        return _render_orderbook()
-    elif view == "conviction":
-        return _render_conviction()
-    elif view == "strategy":
-        return _render_strategy()
-    elif view == "trades":
-        wallet = request.query_params.get("wallet", "")
-        return _render_whale_trades(selected_addr=wallet)
-    elif view == "paper":
+    if view == "paper":
         return _render_paper_portfolio()
+    elif view == "candidates":
+        return _render_whale_candidates()
     else:
         return _render_dashboard()
 
@@ -954,49 +1059,7 @@ async def dashboard(request: Request):
 @app.get("/api/stats")
 async def api_stats():
     stats = get_stats()
-    positions = tracker.get_whale_positions()
-    stats["positions"] = len(positions)
-    stats["high_conviction"] = len(tracker.get_conviction_signals(min_score=0.5))
     return stats
-
-
-@app.get("/api/trades")
-async def api_trades(limit: int = 50):
-    return get_recent_trades(limit)
-
-
-@app.get("/api/whales")
-async def api_whales():
-    return get_whale_summary()
-
-
-@app.get("/api/signals")
-async def api_signals(limit: int = 20):
-    return get_recent_signals(limit)
-
-
-@app.get("/api/positions")
-async def api_positions():
-    return tracker.get_whale_positions()
-
-
-@app.get("/api/conviction")
-async def api_conviction(min_score: float = 0.5):
-    return tracker.get_conviction_signals(min_score=min_score)
-
-
-@app.get("/api/orderbook")
-async def api_orderbook():
-    return _load_orderbook_cache()
-
-
-@app.get("/api/strategy")
-async def api_strategy():
-    return {
-        "report": learner.strategy_report(),
-        "recommendations": learner.get_recommendations(),
-        "parameters": learner.notes.get("parameter_adjustments", {}),
-    }
 
 
 def start_dashboard(host: str = "0.0.0.0", port: int = 9091):

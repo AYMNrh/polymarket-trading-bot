@@ -16,7 +16,7 @@ def main():
     wallets = cfg.get("watched_wallets", [])
     scraper = PolymarketScraper()
     clob = PolymarketClobClient()
-    trader = PaperTrader(bankroll=100.0)
+    trader = PaperTrader()
 
     # 1. Whale overlay: aggregate positions from priority whales
     priority_labels = {"ColdMath", "Sharky6999", "RN1"}

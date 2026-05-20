@@ -155,7 +155,7 @@ class PositionTracker:
                 pos["conviction"] = min(0.95, pos["conviction"] + 0.1)
                 pos["conviction_trend"] = "rising"
                 signal = self._gen_signal(wallet, contract, "CONVICTION_RISING",
-                                          f"Added ${value:.0f} ({len(recent)} adds in a row)", 0.8)
+                                          f"Added ${value:.2f} ({len(recent)} adds in a row)", 0.8)
                 logger.info("📈 CONVICTION RISING: %s adding %s ($%.0f, conf: %.0f%%)",
                             wallet, contract[:10], pos["net_size"], pos["conviction"] * 100)
                 _save_positions(self.positions)

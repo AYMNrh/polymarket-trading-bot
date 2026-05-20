@@ -16,7 +16,7 @@ from polymarket_scraper import PolymarketScraper
 
 
 def load_whale_positions(scraper: PolymarketScraper, cfg: dict) -> tuple[list[dict], int]:
-    """Load overlay positions from configured watched wallets."""
+    """Load overlay positions from quality-weighted watched wallets only."""
     wallets = cfg.get("watched_wallets", [])
     allowed_labels = set(cfg.get("overlay_wallet_labels", []))
     seen_addresses = set()
@@ -28,7 +28,8 @@ def load_whale_positions(scraper: PolymarketScraper, cfg: dict) -> tuple[list[di
         label = wallet.get("label", "")
         if not address or address in seen_addresses:
             continue
-        if allowed_labels and label not in allowed_labels:
+        # Only use quality-weighted wallets for trading signals
+        if not wallet.get("weight", False):
             continue
         seen_addresses.add(address)
         used_wallets += 1
@@ -43,7 +44,7 @@ def load_whale_positions(scraper: PolymarketScraper, cfg: dict) -> tuple[list[di
 
 cfg = load_config()
 scraper = PolymarketScraper()
-trader = PaperTrader(bankroll=100.0)
+trader = PaperTrader()
 
 # 1. Discover curated US weather markets
 markets = trader.discover_weather_markets()

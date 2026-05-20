@@ -12,7 +12,7 @@ from config import load_config
 
 cfg = load_config()
 scraper = PolymarketScraper()
-trader = PaperTrader(bankroll=100.0)
+trader = PaperTrader()
 
 print(f"Starting bankroll: ${trader.state['bankroll']:.2f}")
 print(f"Open positions before cycle: {len([p for p in trader.state.get('positions',{}).values() if p.get('status')=='open'])}")

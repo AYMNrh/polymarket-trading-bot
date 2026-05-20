@@ -31,7 +31,9 @@ def init_db():
                 trades_tracked INTEGER DEFAULT 0,
                 wins INTEGER DEFAULT 0,
                 losses INTEGER DEFAULT 0,
-                is_active INTEGER DEFAULT 1
+                is_active INTEGER DEFAULT 1,
+                profile_json TEXT,
+                profile_updated_at TEXT
             );
             CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -86,6 +88,13 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(timestamp);
             CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(timestamp);
         """)
+        existing_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(whales)").fetchall()
+        }
+        if "profile_json" not in existing_cols:
+            conn.execute("ALTER TABLE whales ADD COLUMN profile_json TEXT")
+        if "profile_updated_at" not in existing_cols:
+            conn.execute("ALTER TABLE whales ADD COLUMN profile_updated_at TEXT")
 
 
 def save_trade(trade: dict):
@@ -128,6 +137,8 @@ def save_whale(whale: dict):
             ON CONFLICT(address) DO UPDATE SET
                 last_seen = COALESCE(excluded.last_seen, whales.last_seen),
                 label = COALESCE(excluded.label, whales.label),
+                total_volume = COALESCE(excluded.total_volume, whales.total_volume),
+                trades_tracked = COALESCE(excluded.trades_tracked, whales.trades_tracked),
                 is_active = 1
         """, (
             whale.get("address"),
@@ -139,6 +150,17 @@ def save_whale(whale: dict):
             whale.get("wins", 0),
             whale.get("losses", 0),
         ))
+
+
+def mark_signals_acted(signal_ids: list[int] = None, signal_type: str = None):
+    """Mark signals as acted upon so they're not reprocessed."""
+    with get_conn() as conn:
+        if signal_ids:
+            placeholders = ",".join("?" for _ in signal_ids)
+            conn.execute(f"UPDATE signals SET acted_on = 1 WHERE id IN ({placeholders})", signal_ids)
+        elif signal_type:
+            conn.execute("UPDATE signals SET acted_on = 1 WHERE signal_type = ?", (signal_type,))
+        conn.commit()
 
 
 def save_signal(signal: dict):
@@ -182,6 +204,18 @@ def get_whale_summary() -> list[dict]:
         return [dict(r) for r in rows]
 
 
+def get_whale_candidates() -> list[dict]:
+    """Load whale candidates from discover_whales.py output."""
+    path = Path(__file__).parent / "data" / "whale_candidates.json"
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text())
+        return data.get("quality", []) + data.get("potential", [])
+    except (json.JSONDecodeError, Exception):
+        return []
+
+
 def get_recent_signals(limit: int = 20) -> list[dict]:
     """Get most recent signals."""
     with get_conn() as conn:
@@ -189,6 +223,31 @@ def get_recent_signals(limit: int = 20) -> list[dict]:
             "SELECT * FROM signals ORDER BY timestamp DESC LIMIT ?", (limit,)
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def get_whale_profile(address: str) -> dict | None:
+    """Load enriched Polymarket profile data from DB, if available."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT profile_json FROM whales WHERE address = ?",
+            (address.lower(),)
+        ).fetchone()
+        if row and row[0]:
+            try:
+                return json.loads(row[0])
+            except (json.JSONDecodeError, TypeError):
+                pass
+    return None
+
+
+def save_whale_profile(address: str, profile_json: str, updated_at: str):
+    """Save enriched profile JSON to the whales table."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE whales SET profile_json = ?, profile_updated_at = ? WHERE address = ?",
+            (profile_json, updated_at, address.lower()),
+        )
+        conn.commit()
 
 
 def get_stats() -> dict:

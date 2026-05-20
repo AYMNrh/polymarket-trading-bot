@@ -2,9 +2,10 @@
 """Decode ColdMath's actual Polymarket trades from on-chain events."""
 import os, sys, requests, json
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-os.environ['POLYGONSCAN_API_KEY'] = 'T35WYX45NH88EENSM71UVNJAZQQDG3Z29I'
 
-key = 'T35WYX45NH88EENSM71UVNJAZQQDG3Z29I'
+key = os.getenv("POLYGONSCAN_API_KEY", "")
+if not key:
+    raise SystemExit("POLYGONSCAN_API_KEY is required")
 neg = '0xC5d563A36AE78145c45a50134d48A1215220f80a'
 cold = '0x594edb9112f526fa6a80b8f858a6379c8a2c1c11'.lower()
 

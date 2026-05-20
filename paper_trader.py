@@ -25,10 +25,14 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
+from v6_logger import logger as v6log
+
 logger = logging.getLogger(__name__)
 
 PAPER_STATE_FILE = Path(__file__).parent / "data" / "paper_portfolio.json"
 PAPER_TRADES_LOG = Path(__file__).parent / "data" / "paper_trades.jsonl"
+TAIL_EXP_STATE_FILE = Path(__file__).parent / "data" / "tail_experiment_portfolio.json"
+TAIL_EXP_TRADES_LOG = Path(__file__).parent / "data" / "tail_experiment_trades.jsonl"
 FORECAST_CACHE: dict[tuple[str, str, str], Optional[float]] = {}
 
 DEFAULT_BANKROLL = 100.0
@@ -40,11 +44,44 @@ MAX_SPREAD = 0.08
 MAX_OPEN_POSITIONS = 12
 MAX_CITY_POSITIONS = 2
 EXPERIMENT_DAYS = 3
-STOP_LOSS_PCT = 35.0
+STOP_LOSS_PCT = 90.0  # last-resort circuit breaker; trailing stop + EV flip are primary exits
 EV_FLIP_EXIT_BUFFER = 0.02
-TAKE_PROFIT_PCT = 150.0
-TAKE_PROFIT_MAX_REMAINING_EDGE = 0.02
-HARD_TAKE_PROFIT_PCT = 500.0
+TAKE_PROFIT_PCT = 100.0
+TAKE_PROFIT_MAX_REMAINING_EDGE = 0.15
+HARD_TAKE_PROFIT_PCT = 400.0
+TRAILING_STOP_PCT = 45.0
+MIN_EDGE_FLOOR = 0.05  # lowered from 0.08 — tighter edge exhaustion tolerance
+MAX_POSITION_DAYS = 3
+# ─── V6 Tail Experiment Constants ──────────────────────────────────────────
+TAIL_EXP_TRADES_LIMIT = 50         # v6.1: run for 50 trades then compare
+TAIL_EXP_ENTRY_MAX = 0.01         # v6.1: raised from $0.005 to unlock more tradeable markets
+TAIL_EXP_HARD_SKIP_PRICE = 0.015  # skip $0.015+ (was $0.006, aligned with entry_max raise)
+TAIL_EXP_FIXED_ALLOCATION = 2.0   # $1-$2 per trade default
+TAIL_EXP_MIN_VOLUME = 5.0         # v6.1: lowered from 10.0; tail buckets have low volume naturally
+
+# V6 Signal: fair_value / entry_price >= 3x
+TAIL_EXP_MIN_EV_RATIO = 3.0
+
+# V6 Profit-taking (flexible percentage ranges)
+TAIL_EXP_MFE50_SELL_PCT = 0.15    # sell 10-20% at +50% MFE (optional)
+TAIL_EXP_X2_SELL_PCT = 0.40       # sell 25-50% at x2 (recover stake)
+TAIL_EXP_X3_SELL_PCT = 0.20       # sell 15-25% at x3
+TAIL_EXP_X4_SELL_PCT = 0.30       # sell 25-40% at x4-x6
+TAIL_EXP_RUNNER_PCT = 0.15        # keep 10-25% runner
+
+# V6 Trailing
+TAIL_EXP_TRAILING_PCT = 30.0      # 25-35% trail from peak, activates at +50% MFE
+TAIL_EXP_MFE_PROTECT = 50.0       # MFE threshold for protection logic
+
+# V6 Minimum hold
+MIN_HOLD_MINUTES = 60
+MIN_HOLD_MINUTES_001 = 120
+
+# ─── V6.1 Tail Experiment Additions ─────────────────────────────────────────
+TAIL_EXP_MARKET_COOLDOWN_MINUTES = 360       # 6h cooldown after non-resolution close
+TAIL_EXP_MAX_ENTRIES_PER_MARKET_PER_DAY = 2  # max re-entries per market per calendar day
+TAIL_EXP_SUSPICIOUS_VOLUME = 25.0            # treat $0.001 markets with volume <$25 as suspicious
+EDGE_EXHAUSTED_COOLDOWN_MINUTES = 720         # 12h cooldown after edge_exhausted (was undefined — bug fix)
 
 WHALE_BOOST = 0.15
 WHALE_PENALTY = -0.20
@@ -60,18 +97,21 @@ FORECAST_LOCATIONS = {
     "NYC": {"lat": 40.7772, "lon": -73.8726, "station": "KLGA", "unit": "F", "region": "us"},
     "Miami": {"lat": 25.7932, "lon": -80.2906, "station": "KMIA", "unit": "F", "region": "us"},
     "Dallas": {"lat": 32.8479, "lon": -96.8518, "station": "KDAL", "unit": "F", "region": "us"},
-    "Denver": {"lat": 39.8617, "lon": -104.673, "station": "KDEN", "unit": "F", "region": "us"},
+    # Denver removed: 50% WR, near-zero PnL
     "Seattle": {"lat": 47.4499, "lon": -122.311, "station": "KSEA", "unit": "F", "region": "us"},
     "Atlanta": {"lat": 33.6407, "lon": -84.4277, "station": "KATL", "unit": "F", "region": "us"},
     "Boston": {"lat": 42.3662, "lon": -71.0621, "station": "KBOS", "unit": "F", "region": "us"},
     "Phoenix": {"lat": 33.4342, "lon": -112.008, "station": "KPHX", "unit": "F", "region": "us"},
     "Houston": {"lat": 29.9901, "lon": -95.3368, "station": "KIAH", "unit": "F", "region": "us"},
-    "Los Angeles": {"lat": 33.9425, "lon": -118.408, "station": "KLAX", "unit": "F", "region": "us"},
-    "San Francisco": {"lat": 37.6188, "lon": -122.375, "station": "KSFO", "unit": "F", "region": "us"},
+    # San Francisco removed: 57% WR, negative PnL
+    # Los Angeles removed: 36% WR, -$2.00 PnL
     "London": {"lat": 51.5074, "lon": -0.1278, "station": "EGLL", "unit": "C", "region": "eu"},
     "Paris": {"lat": 48.8534, "lon": 2.3488, "station": "LFPG", "unit": "C", "region": "eu"},
     "Tokyo": {"lat": 35.6895, "lon": 139.6917, "station": "RJTT", "unit": "C", "region": "as"},
     "Berlin": {"lat": 52.5200, "lon": 13.4050, "station": "EDDB", "unit": "C", "region": "eu"},
+    "Austin": {"lat": 30.2672, "lon": -97.7431, "station": "KAUS", "unit": "F", "region": "us"},
+    "Warsaw": {"lat": 52.2297, "lon": 21.0122, "station": "EPWA", "unit": "C", "region": "eu"},
+    "Wellington": {"lat": -41.2865, "lon": 174.7762, "station": "NZWN", "unit": "C", "region": "eu"},
 }
 
 # =============================================================================
@@ -114,10 +154,11 @@ def _get_forecast_temp(city: str, date_str: str, unit: str = 'F') -> Optional[fl
 # STATE MANAGEMENT
 # =============================================================================
 
-def _load_state() -> dict:
-    if PAPER_STATE_FILE.exists():
+def _load_state(path: Path = None) -> dict:
+    state_file = path or PAPER_STATE_FILE
+    if state_file.exists():
         try:
-            return json.loads(PAPER_STATE_FILE.read_text())
+            return json.loads(state_file.read_text())
         except (json.JSONDecodeError, Exception):
             pass
     return {
@@ -127,6 +168,8 @@ def _load_state() -> dict:
         "total_trades": 0,
         "wins": 0,
         "losses": 0,
+        "wins_real": 0,
+        "wins_flat": 0,
         "parameters": {
             "min_ev": MIN_EV,
             "max_bet": MAX_BET,
@@ -154,14 +197,16 @@ def _load_state() -> dict:
     }
 
 
-def _save_state(state: dict):
-    PAPER_STATE_FILE.parent.mkdir(exist_ok=True)
-    PAPER_STATE_FILE.write_text(json.dumps(state, indent=2, default=str))
+def _save_state(state: dict, path: Path = None):
+    save_path = path or PAPER_STATE_FILE
+    save_path.parent.mkdir(exist_ok=True)
+    save_path.write_text(json.dumps(state, indent=2, default=str))
 
 
-def _log_trade(entry: dict):
-    PAPER_TRADES_LOG.parent.mkdir(exist_ok=True)
-    with open(PAPER_TRADES_LOG, "a") as f:
+def _log_trade(entry: dict, log_path: Path = None):
+    log_file = log_path or PAPER_TRADES_LOG
+    log_file.parent.mkdir(exist_ok=True)
+    with open(log_file, "a") as f:
         f.write(json.dumps(entry, default=str) + "\n")
 
 # =============================================================================
@@ -258,17 +303,46 @@ class PaperTrader:
     """Paper trading engine: EV-driven with whale overlay.
     Self-learning adjusts parameters as trades resolve."""
 
-    def __init__(self, bankroll: float = None):
-        self.state = _load_state()
+    def __init__(self, bankroll: float = None, mode: str = 'normal'):
+        self.mode = mode
+        if mode == 'tail-experiment':
+            self.state_file = TAIL_EXP_STATE_FILE
+            self.trades_log = TAIL_EXP_TRADES_LOG
+        else:
+            self.state_file = PAPER_STATE_FILE
+            self.trades_log = PAPER_TRADES_LOG
+        self.state = _load_state(self.state_file)
         self.state.setdefault("parameters", {})
         self.state["parameters"].setdefault("stop_loss_pct", STOP_LOSS_PCT)
         self.state["parameters"].setdefault("ev_flip_exit_buffer", EV_FLIP_EXIT_BUFFER)
         self.state["parameters"].setdefault("take_profit_pct", TAKE_PROFIT_PCT)
         self.state["parameters"].setdefault("take_profit_max_remaining_edge", TAKE_PROFIT_MAX_REMAINING_EDGE)
         self.state["parameters"].setdefault("hard_take_profit_pct", HARD_TAKE_PROFIT_PCT)
+        self.state["parameters"].setdefault("trailing_stop_pct", TRAILING_STOP_PCT)
+        self.state["parameters"].setdefault("min_edge_floor", MIN_EDGE_FLOOR)
+        self.state["parameters"].setdefault("max_position_days", MAX_POSITION_DAYS)
+        if mode == 'tail-experiment':
+            self.state["parameters"]["trailing_stop_pct"] = TAIL_EXP_TRAILING_PCT
+            self.state['parameters']['hard_take_profit_pct'] = HARD_TAKE_PROFIT_PCT
+        self.state.setdefault('wins_real', 0)
+        self.state.setdefault('wins_flat', 0)
+        self.state.setdefault('losses', 0)
+        self.state.setdefault('recently_edge_exhausted', {})
+        # V6.1: market-level cooldown + daily entry tally
+        self.state.setdefault('market_close_cooldowns', {})
+        self.state.setdefault('market_entry_counts', {})
         if bankroll is not None:
             self.state["bankroll"] = bankroll
             self.state["starting_bankroll"] = bankroll
+        # Reconcile counters from actual position data on every load
+        self.reconcile_counters(self.state)
+        reconciled = self.reconcile_bankroll(self.state)
+        if abs(reconciled - float(self.state.get("bankroll", 0))) > 0.02:
+            logger.warning("Bankroll drifted by $%.2f — reconciling from positions", 
+                          reconciled - float(self.state.get("bankroll", 0)))
+            self.state["bankroll"] = reconciled
+        self.state.setdefault("peak_equity", float(self.state.get("bankroll", 100.0)))
+        self._update_peak_equity()
         self._open_positions = {k: v for k, v in self.state.get("positions", {}).items()
                                 if v.get("status") == "open"}
 
@@ -279,6 +353,105 @@ class PaperTrader:
             self.state = disk_state
             self._open_positions = {k: v for k, v in self.state.get("positions", {}).items()
                                     if v.get("status") == "open"}
+
+    @staticmethod
+    def reconcile_counters(state: dict) -> dict:
+        """Recompute all aggregate counters from actual position data.
+
+        Returns the state dict with corrected wins/losses/wins_real/wins_flat.
+        total_trades is preserved (it counts entries, not positions in dict).
+        """
+        wins = 0
+        losses = 0
+        wins_real = 0
+        wins_flat = 0
+
+        for pos in state.get("positions", {}).values():
+            if pos.get("status") != "closed":
+                continue
+            pnl = float(pos.get("pnl", 0))
+            outcome = pos.get("outcome_class", "")
+            if pnl > 0.05 or outcome == "real_win":
+                wins += 1
+                wins_real += 1
+            elif pnl >= -0.05 or outcome == "flat":
+                wins_flat += 1
+            else:
+                losses += 1
+
+        state["wins"] = wins
+        state["losses"] = losses
+        state["wins_real"] = wins_real
+        state["wins_flat"] = wins_flat
+        return state
+
+    @staticmethod
+    def reconcile_bankroll(state: dict) -> float:
+        """Recompute bankroll from first principles using all positions.
+        
+        Uses the safe formula: starting + sum(closed PnL) - sum(open allocation).
+        Caps result to [starting*0.5, starting*4] to reject impossible values
+        from corrupted states (positions added by repair without corresponding
+        bankroll debits).
+        """
+        starting = float(state.get("starting_bankroll", 100.0))
+        total_closed_pnl = 0.0
+        open_allocation = 0.0
+        
+        for pos in state.get("positions", {}).values():
+            status = pos.get("status", "open")
+            if status == "open":
+                rc = pos.get("reserved_capital")
+                if rc is not None:
+                    alloc = float(rc)
+                else:
+                    side = pos.get("side", "BUY")
+                    shares = float(pos.get("shares", 0))
+                    entry = float(pos.get("entry_price", 0))
+                    alloc = shares * entry if side == "BUY" else shares * (1 - entry)
+                open_allocation += alloc
+            elif status == "closed":
+                total_closed_pnl += float(pos.get("pnl", 0))
+        
+        reconciled = starting + total_closed_pnl - open_allocation
+        # Sanity check: reject values outside [50% starting, 1000% starting]
+        # (allows for tail strategy winners while catching real corruption)
+        max_allowed = starting * 10.0
+        min_allowed = starting * 0.5
+        if reconciled > max_allowed or reconciled < min_allowed:
+            # Fall back to recent-trades estimate: just WARN and return starting
+            logger.warning(
+                "Bankroll reconciliation gave $%.2f (out of bounds [%.2f, %.2f]) — "
+                "likely from state repair artifacts. Using current bankroll.",
+                reconciled, min_allowed, max_allowed,
+            )
+            return float(state.get("bankroll", starting))
+        return round(reconciled, 2)
+
+    def equity(self) -> float:
+        """Current equity = bankroll + sum of open position values."""
+        bankroll = float(self.state.get("bankroll", 0))
+        open_value = sum(
+            float(p.get("value", 0))
+            for p in self.state.get("positions", {}).values()
+            if p.get("status") == "open"
+        )
+        return round(bankroll + open_value, 2)
+
+    def _update_peak_equity(self):
+        """Update peak_equity in state if current equity is higher."""
+        current_eq = self.equity()
+        peak = float(self.state.get("peak_equity", 0))
+        if current_eq > peak:
+            self.state["peak_equity"] = current_eq
+
+    def drawdown_pct(self) -> float:
+        """Drawdown from peak equity as a percentage (0 = no drawdown)."""
+        peak = float(self.state.get("peak_equity", 0))
+        if peak <= 0:
+            return 0.0
+        current_eq = self.equity()
+        return round((peak - current_eq) / peak * 100, 1)
 
     def _open_positions_for_city(self, city: str) -> int:
         if not city:
@@ -294,7 +467,7 @@ class PaperTrader:
 
     def mark_learning_review_complete(self):
         self.state["last_learning_review_date"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        _save_state(self.state)
+        _save_state(self.state, self.state_file)
 
     def build_cycle_report(self, markets: list[dict], whale_positions: list[dict]) -> dict:
         """Summarize candidate quality before execution."""
@@ -338,55 +511,134 @@ class PaperTrader:
                             )
                             if overlay["count"] > 0:
                                 report["markets_with_whale_signal"] += 1
-                            if overlay["adjustment"] > -0.3:
+                            if overlay["aligned"]:
                                 report["tradable_candidates"] += 1
         self.state["last_cycle_report"] = report
-        _save_state(self.state)
+        _save_state(self.state, self.state_file)
         return report
 
     def _risk_exit_reason(self, pos: dict) -> str | None:
-        """Return a stop reason for an open position, or None to keep holding."""
+        """Return a stop reason for an open position, or None to keep holding.
+
+        V6 Exit priority (flexible partials, restricted edge-exhausted):
+          1. x4-x6 sell — sell 25-40%, keep runner
+          2. x3 sell — sell 15-25% (if not already x4 exited)
+          3. x2 sell — sell 25-50% (if not already x4 exited)
+          4. +50% MFE sell — optional sell 10-20%
+          5. Trailing stop — activates at +50% MFE, trails 25-35% from peak
+          6. Profit protection — close if MFE>=+50% and PnL<=0 (NOT if partial profit taken)
+          7. Edge exhausted — heavily restricted (no partial profit, never hit +50%, min hold passed)
+          8. Stop-loss 90% — only for trades that NEVER hit +50%
+          9. Hard TP 400% — unconditional
+        """
         params = self.state.get("parameters", {})
         stop_loss_pct = float(params.get("stop_loss_pct", STOP_LOSS_PCT))
-        ev_flip_exit_buffer = max(
-            float(params.get("ev_flip_exit_buffer", EV_FLIP_EXIT_BUFFER)),
-            float(params.get("min_ev", MIN_EV)) / 2,
-        )
-        take_profit_pct = float(params.get("take_profit_pct", TAKE_PROFIT_PCT))
         hard_take_profit_pct = float(params.get("hard_take_profit_pct", HARD_TAKE_PROFIT_PCT))
-        take_profit_max_remaining_edge = max(
-            float(params.get("take_profit_max_remaining_edge", TAKE_PROFIT_MAX_REMAINING_EDGE)),
-            float(params.get("min_ev", MIN_EV)) / 2,
-        )
+        trailing_stop_pct = float(params.get("trailing_stop_pct", TAIL_EXP_TRAILING_PCT))
+        min_edge_floor = float(params.get("min_edge_floor", MIN_EDGE_FLOOR))
+        mfe_protect = float(params.get("mfe_protect", TAIL_EXP_MFE_PROTECT))
+        max_position_days = int(params.get("max_position_days", MAX_POSITION_DAYS))
 
-        if pos.get("pnl_pct", 0) <= -stop_loss_pct:
+        current_pnl = pos.get("pnl_pct", 0)
+        current_price = pos.get("current_price")
+        entry_price = float(pos.get("entry_price", 0))
+        peak_pnl = pos.get("peak_pnl_pct", current_pnl)
+
+        # Track MFE as percentage of entry price
+        mfe_price = pos.get("mfe_price")
+        mfe_pct = ((mfe_price - entry_price) / entry_price * 100) if mfe_price and entry_price > 0 else 0.0
+
+        # V6.1: Real-bid MFE validation — in low-volume markets, price spikes are fake
+        if self.mode == 'tail-experiment' and entry_price > 0 and mfe_price and entry_price > 0:
+            market_volume = float(pos.get("market_volume", 0) or 0)
+            if market_volume < TAIL_EXP_SUSPICIOUS_VOLUME and mfe_price >= entry_price * 2:
+                # MFE spike is likely from the bot's own order in thin book — don't trust it
+                mfe_pct = 0.0
+
+        hit_mfe_protect = mfe_pct >= mfe_protect  # MFE reached +50%
+
+        # --- Compute age in minutes ---
+        entry_ts = pos.get("entry_ts") or pos.get("opened_at")
+        age_minutes = 0
+        if entry_ts:
+            try:
+                opened = datetime.fromisoformat(entry_ts.replace("Z", "+00:00"))
+                age_minutes = (datetime.now(timezone.utc) - opened).total_seconds() / 60.0
+            except Exception:
+                pass
+
+        min_hold = MIN_HOLD_MINUTES_001 if entry_price <= 0.001 else MIN_HOLD_MINUTES
+
+        # Flags for what's already been sold
+        x2_sold = pos.get("x2_sold", False)
+        x3_sold = pos.get("x3_sold", False)
+        x4_exit = pos.get("x4_exit", False)
+        mfe50_sold = pos.get("mfe50_sold", False)
+        has_partial_profit = pos.get("has_partial_profit", False)
+
+        # Priority 1: x4-x6 — sell 25-40% of original, keep runner
+        if self.mode == 'tail-experiment' and current_price is not None:
+            x2_level = pos.get("x2_level")
+            x3_level = pos.get("x3_level")
+            x4_level = pos.get("x4_level")
+
+            # Priority 1: x4-x6 — sell most, keep runner (V6: no x2/x3 prerequisite)
+            if not x4_exit and x4_level is not None and current_price >= x4_level:
+                return "x4_exit"
+
+            # Priority 2: x3 — sell 15-25% (only if x4 hasn't already handled it)
+            if not x4_exit and not x3_sold and x3_level is not None and current_price >= x3_level:
+                return "x3_sell"
+
+            # Priority 3: x2 — sell 25-50% (only if x4 hasn't already handled it)
+            if not x4_exit and not x2_sold and x2_level is not None and current_price >= x2_level:
+                return "x2_sell"
+
+            # Priority 4: +50% MFE optional sell 10-20%
+            if hit_mfe_protect and not mfe50_sold and not x4_exit:
+                return "mfe50_sell"
+
+        # Priority 5: Trailing stop — activates at +50% MFE, trails from peak
+        if hit_mfe_protect:
+            if peak_pnl > 0 and current_pnl < peak_pnl * (1 - trailing_stop_pct / 100):
+                return "trailing_stop"
+
+        # Priority 6: Profit protection — close if MFE>=+50% AND PnL<=0 (NOT if partial profit taken)
+        if hit_mfe_protect and current_pnl <= 0 and not has_partial_profit:
+            return "profit_protect"
+
+        # Priority 7: Edge exhausted — heavily restricted
+        # ONLY if: min hold passed AND PnL <= 0 AND MFE never hit +50% AND no partial profit taken
+        if not hit_mfe_protect and current_price is not None and not has_partial_profit:
+            fair_price = self._estimate_fair_price(
+                pos.get("title", "?"),
+                pos.get("market_date"),
+                bucket_low=pos.get("bucket_low"),
+                bucket_high=pos.get("bucket_high"),
+            )
+            if fair_price is not None:
+                current_edge = fair_price - float(current_price)
+                abs_edge = abs(current_edge)
+                if abs_edge <= min_edge_floor:
+                    if age_minutes >= min_hold and current_pnl <= 0:
+                        return "edge_exhausted"
+                    else:
+                        # Log blocked edge exit
+                        if hasattr(self, 'logger') and self.logger:
+                            self.logger.log_signal("EDGE_EXIT_BLOCKED",
+                                f"Edge={abs_edge:.4f}, age={age_minutes:.0f}m, PnL={current_pnl:.1f}%, "
+                                f"hold_ok={age_minutes >= min_hold}, pnl_ok={current_pnl <= 0}, "
+                                f"partial={has_partial_profit}, mfe={hit_mfe_protect}",
+                                pos.get("title", "?")[:40])
+
+        # Priority 8: Emergency stop-loss — only for non-protected trades
+        if not hit_mfe_protect and current_pnl <= -stop_loss_pct:
             return "stop_loss"
-        if pos.get("pnl_pct", 0) >= hard_take_profit_pct:
+
+        # Priority 9: Hard TP (unconditional)
+        if current_pnl >= hard_take_profit_pct:
             return "hard_take_profit"
 
-        current_price = pos.get("current_price")
-        if current_price is None:
-            return None
-
-        fair_price = self._estimate_fair_price(
-            pos.get("title", "?"),
-            pos.get("market_date"),
-            bucket_low=pos.get("bucket_low"),
-            bucket_high=pos.get("bucket_high"),
-        )
-        if fair_price is None:
-            return None
-
-        current_edge = fair_price - float(current_price)
-        if (
-            pos.get("pnl_pct", 0) >= take_profit_pct
-            and abs(current_edge) <= take_profit_max_remaining_edge
-        ):
-            return "take_profit"
-        if pos.get("side") == "BUY" and current_edge <= -ev_flip_exit_buffer:
-            return "ev_flip_stop"
-        if pos.get("side") == "SELL" and current_edge >= ev_flip_exit_buffer:
-            return "ev_flip_stop"
         return None
 
     def _close_position(self, pos_key: str, pos: dict, exit_price: float | None = None,
@@ -416,28 +668,186 @@ class PaperTrader:
         if close_reason == "resolved":
             pos["settlement_price"] = exit_price
         pos["resolved_outcome"] = "win" if pnl >= 0 else "loss"
+        # Classify flat exits separately (tail-experiment tracks real wins vs flat vs losses)
+        if pnl > 0.05:
+            pos["outcome_class"] = "real_win"
+        elif pnl >= -0.05:
+            pos["outcome_class"] = "flat"
+        else:
+            pos["outcome_class"] = "loss"
 
         self.state["bankroll"] = round(self.state["bankroll"] + value, 2)
-        if pnl >= 0:
-            self.state["wins"] += 1
-        else:
-            self.state["losses"] += 1
+        # Reconcile all counters from actual position data (prevents drift)
+        self.reconcile_counters(self.state)
+
+        # Track edge_exhausted for market cooldown
+        if close_reason == "edge_exhausted":
+            market_id = pos.get("market_id")
+            if market_id:
+                self.state.setdefault("recently_edge_exhausted", {})
+                self.state["recently_edge_exhausted"][market_id] = datetime.now(timezone.utc).isoformat()
+
+        # V6.1: cooldown for any non-resolution close (stops re-entry loop)
+        if self.mode == 'tail-experiment' and close_reason != "resolved":
+            market_id = pos.get("market_id")
+            if market_id:
+                self.state.setdefault("market_close_cooldowns", {})
+                self.state["market_close_cooldowns"][market_id] = datetime.now(timezone.utc).isoformat()
 
         self.state["positions"][pos_key] = pos
-        _log_trade({"action": "CLOSE", **pos})
-        _save_state(self.state)
+        _log_trade({"action": "CLOSE", **pos}, self.trades_log)
+        _save_state(self.state, self.state_file)
         if pos_key in self._open_positions:
             del self._open_positions[pos_key]
+        self._update_peak_equity()
+
+        # V6 event log
+        if self.mode == 'tail-experiment':
+            v6log.log_full_close(
+                position_id=pos_key, market_id=pos.get("market_id", ""),
+                reason=close_reason, price=exit_price,
+                shares=float(pos.get("shares", 0)),
+                cash_delta=value,
+                realized_pnl_delta=pnl,
+                bankroll_before=round(self.state['bankroll'] - value, 2),
+                bankroll_after=round(self.state['bankroll'], 2),
+                mfe_pct=pos.get("peak_pnl_pct", 0),
+                outcome="win" if pnl >= 0 else "loss",
+            )
         logger.info("CLOSE %s via %s: $%.2f PnL", pos.get("title", "?")[:35], close_reason, pnl)
         return pos
 
+    def _partial_close(self, pos_key: str, pos: dict, exit_price: float | None = None,
+                       reason: str = "x2_sell") -> dict | None:
+        """Sell a portion of shares at multiple-based exit levels (V6).
+
+        x2_sell: sell TAIL_EXP_X2_SELL_PCT of original shares at +100% → free-roll.
+        x3_sell: sell TAIL_EXP_X3_SELL_PCT of original shares at +200%.
+        x4_exit: sell most remaining, keep TAIL_EXP_RUNNER_PCT runner. Position stays open with runner.
+        mfe50_sell: sell TAIL_EXP_MFE50_SELL_PCT of original shares at +50% MFE.
+
+        Returns the exit record or None if position fully closed.
+        """
+        if exit_price is None:
+            exit_price = pos.get("current_price", pos.get("entry_price", 0))
+        exit_price = float(exit_price)
+
+        original_shares = float(pos.get("original_shares", pos.get("shares", 0)))
+        entry_price = float(pos.get("entry_price", 0))
+        remaining = float(pos.get("shares", 0))
+
+        if reason == "x2_sell":
+            shares_to_sell = round(original_shares * TAIL_EXP_X2_SELL_PCT, 2)
+            new_flag = "x2_sold"
+        elif reason == "x3_sell":
+            shares_to_sell = round(original_shares * TAIL_EXP_X3_SELL_PCT, 2)
+            new_flag = "x3_sold"
+        elif reason == "x4_exit":
+            # Sell most remaining, keep only the runner
+            runner_shares = round(original_shares * TAIL_EXP_RUNNER_PCT, 2)
+            shares_to_sell = round(remaining - runner_shares, 2)
+            new_flag = "x4_exit"
+            if shares_to_sell <= 0:
+                return None
+        elif reason == "mfe50_sell":
+            shares_to_sell = round(original_shares * TAIL_EXP_MFE50_SELL_PCT, 2)
+            new_flag = "mfe50_sold"
+        else:
+            return None
+
+        # Clamp to actual remaining
+        shares_to_sell = min(shares_to_sell, remaining)
+        if shares_to_sell <= 0:
+            return None
+
+        pnl_on_sale = round(shares_to_sell * (exit_price - entry_price), 2)
+        proceeds = round(shares_to_sell * exit_price, 2)
+
+        # Record the exit
+        exit_record = {
+            "shares": round(shares_to_sell, 4),
+            "price": exit_price,
+            "pnl": pnl_on_sale,
+            "reason": reason,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+        pos.setdefault("exits", []).append(exit_record)
+        pos[new_flag] = True
+        pos["has_partial_profit"] = True
+
+        # Reduce shares
+        remaining = round(remaining - shares_to_sell, 4)
+        pos["shares"] = remaining
+
+        # Return proceeds to bankroll
+        bankroll_before_close = round(self.state["bankroll"], 2)
+        self.state["bankroll"] = round(self.state["bankroll"] + proceeds, 2)
+
+        if remaining <= 0 or reason == "x4_exit":
+            # x4_exit: runner stays open — don't close position
+            if reason == "x4_exit" and remaining > 0:
+                pass  # runner stays open
+            else:
+                self._close_position(pos_key, pos, exit_price, reason)
+                return None
+
+        # Update value/pnl for remaining shares
+        value, pnl, pnl_pct = _position_pnl_metrics(
+            pos.get("side", "BUY"),
+            remaining,
+            entry_price,
+            exit_price,
+            pos.get("reserved_capital"),
+        )
+        pos["current_price"] = exit_price
+        pos["value"] = value
+        pos["pnl"] = pnl
+        pos["pnl_pct"] = pnl_pct
+
+        _save_state(self.state, self.state_file)
+        _log_trade({"action": "PARTIAL_CLOSE", **pos, "partial_exit": exit_record}, self.trades_log)
+
+        # V6 event log
+        if self.mode == 'tail-experiment':
+            peak_pnl = pos.get("peak_pnl_pct", 0)
+            mfe_for_log = peak_pnl if peak_pnl else pnl_pct
+            v6log.log_partial_close(
+                position_id=pos_key, market_id=pos.get("market_id", ""),
+                reason=reason, price=exit_price,
+                shares_sold=shares_to_sell,
+                cash_delta=proceeds,
+                realized_pnl_delta=pnl_on_sale,
+                remaining_shares=remaining,
+                bankroll_before=bankroll_before_close,
+                bankroll_after=round(self.state['bankroll'], 2),
+                mfe_pct=mfe_for_log,
+            )
+        logger.info("PARTIAL %s %s: sold %.0f shares at $%.3f (%.1f%%), $%.2f PnL on sale, %.0f remain",
+                    reason, pos.get("title", "?")[:30], shares_to_sell, exit_price,
+                    ((exit_price - entry_price) / entry_price) * 100, pnl_on_sale, remaining)
+        return exit_record
+
     def apply_risk_stops(self) -> list[dict]:
-        """Close open positions when stop-loss or EV-flip rules trigger."""
+        """Apply v6 exit rules to open positions.
+        Partial exits (x2_sell, x3_sell, x4_exit, mfe50_sell) handled by _partial_close.
+        Full closes (trailing_stop, profit_protect, edge_exhausted, stop_loss, hard_take_profit)
+        handled by _close_position.
+        """
         closed = []
         for pos_key, pos in list(self._open_positions.items()):
+            # Update peak PnL tracking
+            current_pnl = pos.get("pnl_pct", 0)
+            peak = pos.get("peak_pnl_pct")
+            if peak is None or current_pnl > peak:
+                pos["peak_pnl_pct"] = current_pnl
+
             reason = self._risk_exit_reason(pos)
             if reason:
-                closed.append(self._close_position(pos_key, pos, pos.get("current_price"), reason))
+                # Multiple-based partial exits
+                if self.mode == 'tail-experiment' and reason in ('x2_sell', 'x3_sell', 'x4_exit', 'mfe50_sell'):
+                    self._partial_close(pos_key, pos, pos.get("current_price"), reason)
+                else:
+                    closed.append(self._close_position(pos_key, pos, pos.get("current_price"), reason))
         return closed
 
     def evaluate_and_trade(self, market: dict, whale_positions: list[dict] = None,
@@ -498,6 +908,45 @@ class PaperTrader:
         current_max_positions = int(params.get('max_positions', MAX_OPEN_POSITIONS))
         current_max_city_positions = int(params.get('max_city_positions', MAX_CITY_POSITIONS))
 
+        # --- Edge exhausted market cooldown (tail-experiment) ---
+        if self.mode == 'tail-experiment':
+            ee = self.state.get('recently_edge_exhausted', {})
+            if market_id in ee:
+                last_ee_ts = ee[market_id]
+                try:
+                    last_ee_dt = datetime.fromisoformat(last_ee_ts.replace("Z", "+00:00"))
+                    minutes_since = (datetime.now(timezone.utc) - last_ee_dt).total_seconds() / 60.0
+                    if minutes_since < EDGE_EXHAUSTED_COOLDOWN_MINUTES:
+                        return None
+                    else:
+                        # Cooldown expired — clean up stale entry
+                        del ee[market_id]
+                except Exception:
+                    pass
+
+            # V6.1: General market cooldown after any non-resolution close
+            cooldowns = self.state.get('market_close_cooldowns', {})
+            if market_id in cooldowns:
+                try:
+                    last_close_dt = datetime.fromisoformat(cooldowns[market_id].replace("Z", "+00:00"))
+                    minutes_since = (datetime.now(timezone.utc) - last_close_dt).total_seconds() / 60.0
+                    if minutes_since < TAIL_EXP_MARKET_COOLDOWN_MINUTES:
+                        return None
+                    else:
+                        del cooldowns[market_id]
+                except Exception:
+                    pass
+
+            # V6.1: Daily entry count check — max 1-2 entries per market per day
+            today_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            entry_counts = self.state.get('market_entry_counts', {})
+            market_today = entry_counts.get(market_id, {})
+            if not isinstance(market_today, dict):
+                market_today = {}
+            if market_today.get("date") == today_key:
+                if market_today.get("count", 0) >= TAIL_EXP_MAX_ENTRIES_PER_MARKET_PER_DAY:
+                    return None
+
         best_bid = market.get("bestBid")
         best_ask = market.get("bestAsk")
         volume = float(market.get("volume", 0) or 0)
@@ -519,7 +968,10 @@ class PaperTrader:
         spread = float(best_ask) - float(best_bid)
         if spread > current_max_spread:
             return None
-        if volume < current_min_volume:
+        if self.mode == 'tail-experiment':
+            if volume < TAIL_EXP_MIN_VOLUME:
+                return None
+        elif volume < current_min_volume:
             return None
 
         # Max price check from learned parameters
@@ -540,29 +992,72 @@ class PaperTrader:
 
         # Compute EV
         ev = fair_price - price
-        if abs(ev) < current_min_ev:
+        if abs(ev) < current_min_ev and self.mode != 'tail-experiment':
             return None
 
         direction = "BUY" if ev > 0 else "SELL"
         base_confidence = min(0.9, 0.5 + abs(ev))
 
+        # No SELL trades — they're flat-to-negative ($0.72 on 43 trades)
+        if direction == 'SELL':
+            return None
+
+        # Tail-experiment filters
+        if self.mode == 'tail-experiment':
+            if direction != 'BUY':
+                return None  # BUY-only
+            title_lower = title.lower()
+            if 'or higher' not in title_lower and 'or below' not in title_lower:
+                return None  # tail-only
+            # Hard skip: $0.006+ never enters
+            if price >= TAIL_EXP_HARD_SKIP_PRICE:
+                return None
+            # Entry max: $0.005 only with very strong EV
+            if price > TAIL_EXP_ENTRY_MAX:
+                return None
+            # V6 Signal: fair_value / entry_price >= 3x
+            if fair_price is None or fair_price <= 0 or price <= 0:
+                return None
+            ev_ratio = fair_price / price
+            if ev_ratio < TAIL_EXP_MIN_EV_RATIO:
+                return None
+            # V6.1: Suspicious volume check — $0.001 markets with volume <$25 may have fake MFE
+            if price <= 0.001 and volume < TAIL_EXP_SUSPICIOUS_VOLUME:
+                return None
+            # Check trade limit — hard stop at 100
+            total_trades = self.state.get("total_trades", 0)
+            if total_trades >= TAIL_EXP_TRADES_LIMIT:
+                logger.info("Tail experiment: hit %d trade limit, stopping", TAIL_EXP_TRADES_LIMIT)
+                return None
+
         # Whale overlay
         whale_overlay = self._check_whale_overlay(title, direction, whale_positions or [])
         confidence = base_confidence + whale_overlay["adjustment"]
         confidence = max(0.05, min(0.99, confidence))
-
-        # Whales are an overlay, not the source of truth. Strong opposition vetoes only weak edges.
-        if whale_overlay["adjustment"] <= -0.20 and abs(ev) < max(current_min_ev * 2, 0.10):
-            return None
         if confidence < 0.3:
             return None
 
-        # Kelly sizing with whale boost
-        kelly_raw = _kelly_fraction(fair_price, price) if direction == "BUY" else _kelly_fraction(1-fair_price, 1-price)
-        kelly_adjusted = kelly_raw * (1.0 + whale_overlay["size_boost"])
-        effective_kelly_fraction = max(0.0, float(current_kelly_fraction))
-        allocation = _kelly_size(kelly_adjusted * effective_kelly_fraction, self.state["bankroll"])
-        allocation = min(allocation, current_max_bet)
+        # Whale gate — skipped in tail-experiment mode (pure EV trading)
+        if self.mode != 'tail-experiment':
+            weather_whale_count = self._count_weather_whales(whale_positions or [])
+            if whale_overlay["count"] == 0 and weather_whale_count >= 3:
+                return None
+            if not whale_overlay["aligned"]:
+                return None
+
+        # Sizing
+        if self.mode == 'tail-experiment':
+            # Fixed $2 per trade for tail experiment
+            allocation = TAIL_EXP_FIXED_ALLOCATION
+            kelly_adjusted = 0.0
+            effective_kelly_fraction = 0.0
+        else:
+            # Kelly sizing with whale boost
+            kelly_raw = _kelly_fraction(fair_price, price) if direction == "BUY" else _kelly_fraction(1-fair_price, 1-price)
+            kelly_adjusted = kelly_raw * (1.0 + whale_overlay["size_boost"])
+            effective_kelly_fraction = max(0.0, float(current_kelly_fraction))
+            allocation = _kelly_size(kelly_adjusted * effective_kelly_fraction, self.state["bankroll"])
+            allocation = min(allocation, current_max_bet)
 
         # Cap exposure at 50% of bankroll and max 15 positions
         current_exposure = sum(p.get("value", 0) for p in self._open_positions.values())
@@ -616,7 +1111,25 @@ class PaperTrader:
             "forecast_temp": forecast_temp,
             "forecast_source": "ecmwf",
             "reserved_capital": round(allocation, 2),
+            "mfe_price": round(price, 4),
+            "mae_price": round(price, 4),
         }
+
+        # Multiple-based exit levels for tail experiment (V6)
+        if self.mode == 'tail-experiment':
+            entry["original_shares"] = round(shares, 2)
+            entry["exits"] = []
+            entry["x2_level"] = round(price * 2, 4)
+            entry["x3_level"] = round(price * 3, 4)
+            entry["x4_level"] = round(price * 4, 4)
+            entry["mfe50_sold"] = False
+            entry["x2_sold"] = False
+            entry["x3_sold"] = False
+            entry["x4_exit"] = False
+            entry["has_partial_profit"] = False
+            min_hold_val = MIN_HOLD_MINUTES_001 if price <= 0.001 else MIN_HOLD_MINUTES
+            entry["min_hold_until"] = (datetime.now(timezone.utc) + timedelta(minutes=min_hold_val)).isoformat()
+            entry["ev_ratio"] = round(ev_ratio, 2)
 
         # Dedup by condition_id first
         pos_key = f"{condition_id}-{direction}" if condition_id else slug
@@ -639,20 +1152,59 @@ class PaperTrader:
             pos['value'] = value
             pos['pnl'] = pnl
             pos["pnl_pct"] = pnl_pct
+            # MFE/MAE tracking for experiment mode
+            if self.mode == 'tail-experiment':
+                current_p = float(price)
+                mfe = pos.get('mfe_price')
+                mae = pos.get('mae_price')
+                if mfe is None or current_p > mfe:
+                    pos['mfe_price'] = current_p
+                if mae is None or current_p < mae:
+                    pos['mae_price'] = current_p
             self.state["positions"][existing_key] = pos
-            _log_trade({"action": "UPDATE", **pos})
-            _save_state(self.state)
+            _log_trade({"action": "UPDATE", **pos}, self.trades_log)
+            _save_state(self.state, self.state_file)
             return pos
 
         # Deduct bankroll on position open
+        bankroll_before = round(self.state['bankroll'], 2)
         self.state['bankroll'] = round(self.state['bankroll'] - allocation, 2)
 
         # Open new position
         self.state["positions"][pos_key] = entry
         self.state["total_trades"] += 1
         self._open_positions[pos_key] = entry
-        _log_trade({"action": "OPEN", **entry})
-        _save_state(self.state)
+        _log_trade({"action": "OPEN", **entry}, self.trades_log)
+        _save_state(self.state, self.state_file)
+
+        # V6.1: Track daily entry count for this market
+        if self.mode == 'tail-experiment' and market_id:
+            today_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            entry_counts = self.state.setdefault('market_entry_counts', {})
+            current = entry_counts.get(market_id, {})
+            if not isinstance(current, dict):
+                current = {}
+            if current.get("date") == today_key:
+                current["count"] = current.get("count", 0) + 1
+            else:
+                current = {"date": today_key, "count": 1}
+            entry_counts[market_id] = current
+
+        # V6 event log
+        if self.mode == 'tail-experiment':
+            v6log.log_open(
+                position_id=pos_key, market_id=market_id,
+                entry_price=round(price, 4), shares=shares,
+                cost=round(allocation, 2),
+                bankroll_before=bankroll_before,
+                bankroll_after=round(self.state['bankroll'], 2),
+                model_fair_value=round(fair_price, 4),
+                ev_ratio=round(ev_ratio, 2) if self.mode == 'tail-experiment' else None,
+                forecast_temp=forecast_temp,
+                threshold=bucket_high if bucket_high != 999.0 else bucket_low if bucket_low != -999.0 else None,
+                city=city,
+                bucket_type="below" if bucket_low == -999.0 else "above" if bucket_high == 999.0 else "range",
+            )
         logger.info("%s %s: $%.2f at %.1fc (EV:%+.2f, whale:%+.2f, conf:%.0f%%)",
                     direction, title[:35], allocation, price * 100,
                     ev * 100, whale_overlay["adjustment"] * 100, confidence * 100)
@@ -686,9 +1238,22 @@ class PaperTrader:
             return
         return self._close_position(pos_key, pos, resolved_price, "resolved")
 
+    def _count_weather_whales(self, whale_positions: list[dict]) -> int:
+        """Count unique quality whales holding weather positions."""
+        weather_addresses = set()
+        for wp in whale_positions or []:
+            wt = (wp.get("title") or "").lower()
+            if "temperature" in wt or "highest" in wt or "lowest" in wt:
+                addr = wp.get("wallet_address", "") or wp.get("address", "")
+                if addr:
+                    weather_addresses.add(addr)
+        return len(weather_addresses)
+
     def _check_whale_overlay(self, title: str, direction: str,
                               whale_positions: list[dict]) -> dict:
-        """Check if whales are in this market and what direction."""
+        """Check if quality whales are in this market and what direction.
+        Only counts positions from quality-weighted wallets.
+        Requires 2+ aligned quality whales to signal alignment."""
         title_lower = title.lower()
         aligned = 0
         opposed = 0
@@ -706,7 +1271,14 @@ class PaperTrader:
         adjustment = aligned * WHALE_BOOST + opposed * WHALE_PENALTY
         size_boost = aligned * CONSENSUS_BOOST
         count = aligned + opposed
-        aligned_flag = aligned > opposed
+        # Dynamic gate: when ≤2 quality whales hold weather positions,
+        # allow EV-only trades (no whale alignment needed).
+        # When 3+ weather whales exist in the live scrape, gate on alignment.
+        weather_whale_count = self._count_weather_whales(whale_positions)
+        if weather_whale_count >= 3:
+            aligned_flag = aligned >= 1
+        else:
+            aligned_flag = True  # fallback to EV-only when weather whales are scarce
 
         return {
             "adjustment": adjustment,
@@ -720,7 +1292,7 @@ class PaperTrader:
             return False
         city_tokens = [
             "new york city", "new york", "nyc", "chicago", "miami", "dallas", "denver",
-            "seattle", "atlanta", "boston", "phoenix", "houston", "los angeles",
+            "seattle", "atlanta", "boston", "phoenix", "houston",
             "san francisco",
         ]
         city_pattern = "(" + "|".join(re.escape(token) for token in city_tokens) + ")"
@@ -743,7 +1315,7 @@ class PaperTrader:
             "new-york": "NYC", "chicago": "Chicago", "miami": "Miami",
             "dallas": "Dallas", "denver": "Denver", "seattle": "Seattle",
             "atlanta": "Atlanta", "boston": "Boston", "phoenix": "Phoenix",
-            "houston": "Houston", "los-angeles": "Los Angeles",
+            "houston": "Houston",
             "san-francisco": "San Francisco", "london": "London",
             "paris": "Paris", "tokyo": "Tokyo", "berlin": "Berlin",
             "sydney": "Sydney", "mexico-city": "Mexico City",
@@ -934,9 +1506,23 @@ class PaperTrader:
                 pos['value'] = value
                 pos['pnl'] = pnl
                 pos['pnl_pct'] = pnl_pct
+                # Track peak PnL for trailing stop
+                peak = pos.get("peak_pnl_pct")
+                if peak is None or pnl_pct > peak:
+                    pos["peak_pnl_pct"] = pnl_pct
+                # Track MFE/MAE for experiment analysis
+                if self.mode == 'tail-experiment':
+                    entry_price = float(pos.get('entry_price', 1))
+                    current = float(price)
+                    mfe = pos.get('mfe_price')
+                    mae = pos.get('mae_price')
+                    if mfe is None or current > mfe:
+                        pos['mfe_price'] = current
+                    if mae is None or current < mae:
+                        pos['mae_price'] = current
             except Exception:
                 pass
-        _save_state(self.state)
+        _save_state(self.state, self.state_file)
 
     def _get_actual_temp(self, city, date_str, unit='F'):
         """Get actual temperature from Open-Meteo ERA5 reanalysis (free, no key)."""
@@ -1028,7 +1614,7 @@ class PaperTrader:
             learned = notes.get('parameter_adjustments', {})
             if learned:
                 self.state.setdefault('parameters', {}).update(learned)
-                _save_state(self.state)
+                _save_state(self.state, self.state_file)
                 logger.info(f'Applied learned parameters: {learned}')
                 return learned
         except Exception:

@@ -1,13 +1,12 @@
-#!/usr/bin/env python3
 import json
 from pathlib import Path
 from datetime import datetime
 
-BASE = Path('data')
+BASE = Path('/home/aymen/projects/scripts/trading-bot')
 
 # Read paper portfolio
 state = {}
-pf = BASE / 'paper_portfolio.json'
+pf = BASE / 'data' / 'paper_portfolio.json'
 if pf.exists():
     state = json.loads(pf.read_text())
 
@@ -20,9 +19,9 @@ summary = {
     'exposure': state.get('exposure', 0),
 }
 
-# Check last action from trades log
+# Last action from trades log
 last_action = 'none yet'
-trades_log = BASE / 'paper_trades.jsonl'
+trades_log = BASE / 'data' / 'paper_trades.jsonl'
 if trades_log.exists():
     lines = trades_log.read_text().strip().split('\n')
     if lines and lines[-1]:
@@ -32,23 +31,13 @@ if trades_log.exists():
         except:
             pass
 
-# Check whale positions
+# Whale data
+whale_file = BASE / 'data' / 'whale_portfolios.json'
 whale_stats = ''
-whale_convictions = ''
-whale_file = BASE / 'whale_positions.json'
 if whale_file.exists():
     wf = json.loads(whale_file.read_text())
-    active = [k for k, v in wf.items() if isinstance(v, dict) and v.get('profile', {}).get('trades', 0) > 0]
+    active = [k for k, v in wf.items() if v.get('profile', {}).get('trades', 0) > 0]
     whale_stats = f'{len(active)} whales tracked'
-    convictions = []
-    for addr, data in wf.items():
-        if not isinstance(data, dict):
-            continue
-        conv = data.get('conviction', {})
-        if conv and conv.get('signal'):
-            convictions.append(f"{data.get('label','?')}: {conv.get('signal')}")
-    if convictions:
-        whale_convictions = ' | '.join(convictions[:2])
 
 pnl = summary.get('bankroll', 100) - 100
 win_rate = summary['wins'] / max(1, summary['wins'] + summary['losses']) * 100
@@ -68,8 +57,6 @@ if last_action != 'none yet':
     msg += f' | Last: {last_action}'
 
 if whale_stats:
-    msg += f' | 🐋 {whale_stats}'
-if whale_convictions:
-    msg += f' | Conviction: {whale_convictions}'
+    msg += f' | {whale_stats}'
 
 print(msg)

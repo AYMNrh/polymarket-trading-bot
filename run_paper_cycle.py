@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""EV + whale overlay paper trading cycle — cron job entrypoint."""
 import logging, json, sys
 
 logging.basicConfig(level=logging.WARNING, stream=sys.stdout)
@@ -10,25 +9,25 @@ from config import load_config
 
 cfg = load_config()
 scraper = PolymarketScraper()
-trader = PaperTrader(bankroll=100.0)
+trader = PaperTrader()
 
-# 1. Discover weather markets via event slugs
+# 1. Discover weather markets via event slugs (proven approach)
 markets = trader.discover_weather_markets()
-print(f"Markets: {len(markets)}")
+print(f'Markets: {len(markets)}')
 
 # 2. Get whale overlay
-wallets = cfg.get("watched_wallets", [])
+wallets = cfg.get('watched_wallets', [])
 all_pos = []
 for w in wallets:
-    if w.get("label") in ("ColdMath", "Sharky6999", "RN1"):
+    if w.get('label') in ('ColdMath', 'Sharky6999', 'RN1'):
         try:
-            p = scraper.get_positions(w["address"])
+            p = scraper.get_positions(w['address'])
             if p:
                 all_pos.extend(p)
         except Exception:
             pass
 
-print(f"Whale positions: {len(all_pos)}")
+print(f'Whale positions: {len(all_pos)}')
 
 # 3. Evaluate and trade
 opened = 0
@@ -41,4 +40,4 @@ for m in markets:
         pass
 
 s = trader.summary()
-print(f"Opened: {opened}, Open: {s['open_positions']}, PnL: ${s['total_pnl']:.2f}, Exp: ${s['exposure']:.2f}")
+print(f'Opened: {opened}, Open: {s["open_positions"]}, PnL: ${s["total_pnl"]:.2f}, Exp: ${s["exposure"]:.2f}')
