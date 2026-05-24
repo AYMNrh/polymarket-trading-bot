@@ -26,7 +26,7 @@ from position_tracker import PositionTracker
 from self_learning import SelfLearningEngine
 from onchain_decoder import OnChainTradeDecoder
 from polymarket_scraper import PolymarketScraper
-from paper_trader import PaperTrader
+from paper_trader import STRATEGY1_MODE, STRATEGY2_MODE, STRATEGY3_MODE, RUNTIME_LOG, PaperTrader
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +117,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <a href="/" class="active">Dashboard</a>
             <a href="/?view=candidates">Whale Candidates</a>
             <a href="/?view=paper">Paper Portfolio</a>
+            <a href="/?view=strategy1">Strategy 1</a>
+            <a href="/?view=strategy2">Strategy 2</a>
+            <a href="/?view=strategy3">Strategy 3</a>
+            <a href="/?view=strategy-report">Strategy Report</a>
         </div>
 
         <div class="stats">
@@ -1044,12 +1048,185 @@ def _render_whale_candidates() -> str:
     )
 
 
+def _position_net_pnl(pos: dict) -> float:
+    exits = pos.get("exits", []) or []
+    return float(pos.get("pnl", 0) or 0) + sum(float(e.get("pnl", 0) or 0) for e in exits if isinstance(e, dict))
+
+
+def _load_runtime_events(strategy: str, limit: int = 60) -> list[dict]:
+    if not RUNTIME_LOG.exists():
+        return []
+    rows = []
+    try:
+        with RUNTIME_LOG.open() as f:
+            for line in f:
+                try:
+                    event = json.loads(line)
+                except Exception:
+                    continue
+                if event.get("strategy") == strategy:
+                    rows.append(event)
+    except Exception:
+        return []
+    return rows[-limit:][::-1]
+
+
+def _render_strategy_page(mode: str) -> str:
+    trader = PaperTrader(mode=mode)
+    summary = trader.summary()
+    state = trader.state
+    experiment = state.get("experiment", {})
+    positions = list(state.get("positions", {}).values())
+    open_positions = [p for p in positions if p.get("status") == "open"]
+    closed_positions = [p for p in positions if p.get("status") == "closed"]
+    closed_positions.sort(key=lambda p: p.get("closed_at", ""), reverse=True)
+
+    open_value = sum(float(p.get("value", 0) or 0) for p in open_positions)
+    realized_pnl = sum(_position_net_pnl(p) for p in closed_positions)
+    unrealized_pnl = sum(_position_net_pnl(p) for p in open_positions)
+    total_pnl = realized_pnl + unrealized_pnl
+    starting_bankroll = float(summary.get("starting_bankroll", 100) or 100)
+    ledger_equity = starting_bankroll + total_pnl
+    cash_bankroll = float(summary.get("bankroll", 0) or 0)
+    unique_markets = len({
+        p.get("condition_id") or p.get("market_id") or p.get("event_slug")
+        for p in positions
+        if p.get("condition_id") or p.get("market_id") or p.get("event_slug")
+    })
+    wins = sum(1 for p in closed_positions if _position_net_pnl(p) > 0.05)
+    losses = sum(1 for p in closed_positions if _position_net_pnl(p) < -0.05)
+    flats = max(0, len(closed_positions) - wins - losses)
+    win_rate = wins / max(1, wins + losses) * 100
+
+    def position_row(p: dict, closed: bool = False) -> str:
+        pnl = _position_net_pnl(p)
+        pnl_cls = "positive" if pnl >= 0 else "negative"
+        side_cls = "buy" if p.get("side") == "BUY" else "sell"
+        ev_ratio = 0.0
+        try:
+            ev_ratio = float(p.get("fair_price", 0)) / max(0.0001, float(p.get("entry_price", 0)))
+        except Exception:
+            pass
+        when = p.get("closed_at") if closed else p.get("entry_ts")
+        reason = p.get("close_reason", "open" if not closed else "")
+        return (
+            f"<tr><td class='{side_cls}'>{p.get('side', '?')}</td>"
+            f"<td>{p.get('city', '')}</td>"
+            f"<td style='font-size:0.85em'>{p.get('title', '?')}</td>"
+            f"<td>${float(p.get('entry_price', 0) or 0):.4f}</td>"
+            f"<td>${float(p.get('current_price', 0) or 0):.4f}</td>"
+            f"<td>{ev_ratio:.1f}x</td>"
+            f"<td>${float(p.get('value', 0) or 0):.2f}</td>"
+            f"<td class='{pnl_cls}'>${pnl:+.2f}</td>"
+            f"<td>{reason}</td>"
+            f"<td>{str(when or '')[:16]}</td></tr>"
+        )
+
+    open_rows = "".join(position_row(p) for p in sorted(open_positions, key=_position_net_pnl, reverse=True))
+    closed_rows = "".join(position_row(p, closed=True) for p in closed_positions[:80])
+
+    event_rows = ""
+    for event in _load_runtime_events(mode):
+        details = event.get("details", {})
+        event_rows += (
+            f"<tr><td>{str(event.get('ts', ''))[:19]}</td>"
+            f"<td><span class='badge badge-signal'>{event.get('event_type', '')}</span></td>"
+            f"<td>{event.get('message', '')}</td>"
+            f"<td style='font-family:monospace;font-size:0.8em;color:#888'>{json.dumps(details, default=str)[:220]}</td></tr>"
+        )
+
+    last_cycle = state.get("last_strategy_cycle", {})
+    last_monitor = state.get("last_monitor_cycle", {})
+    stake_state = state.get("stake_state", {}) if mode == STRATEGY3_MODE else {}
+    stake_cards = ""
+    if stake_state:
+        stake_cards = f"""
+                <div class="stat-card"><div class="value">${float(stake_state.get('current_stake', 0) or 0):.2f}</div><div class="label">Next Stake</div></div>
+                <div class="stat-card"><div class="value">${float(stake_state.get('max_stake', 0) or 0):.2f}</div><div class="label">Max Stake</div></div>
+                <div class="stat-card"><div class="value">{float(stake_state.get('profit_reinvest_pct', 0) or 0) * 100:.0f}%</div><div class="label">Profit Reinvest</div><div class="sub">{stake_state.get('last_update_reason', 'initialized')}</div></div>
+        """
+    name = experiment.get("name", mode)
+    rules = experiment.get("rules", "")
+    main = f"""
+        <div class="section">
+            <h2>{name}</h2>
+            <p style="color:#888;margin-bottom:16px">{rules}</p>
+            <div class="stats">
+                <div class="stat-card"><div class="value">${ledger_equity:.2f}</div><div class="label">Ledger Equity</div></div>
+                <div class="stat-card"><div class="value" style="color:{'#00d4aa' if total_pnl >= 0 else '#ff6b6b'}">${total_pnl:+.2f}</div><div class="label">Total PnL</div></div>
+                <div class="stat-card"><div class="value" style="color:{'#00d4aa' if realized_pnl >= 0 else '#ff6b6b'}">${realized_pnl:+.2f}</div><div class="label">Realized PnL</div></div>
+                <div class="stat-card"><div class="value" style="color:{'#00d4aa' if unrealized_pnl >= 0 else '#ff6b6b'}">${unrealized_pnl:+.2f}</div><div class="label">Open PnL</div></div>
+                <div class="stat-card"><div class="value">${cash_bankroll:.2f}</div><div class="label">Cash State</div><div class="sub">preserved repair value</div></div>
+                <div class="stat-card"><div class="value">${open_value:.2f}</div><div class="label">Open Value</div></div>
+                <div class="stat-card"><div class="value">{len(open_positions)}</div><div class="label">Open Positions</div></div>
+                <div class="stat-card"><div class="value">{len(closed_positions)}</div><div class="label">Closed Positions</div></div>
+                <div class="stat-card"><div class="value">{win_rate:.0f}%</div><div class="label">Closed Win Rate</div><div class="sub">{wins}W/{losses}L/{flats}F</div></div>
+                <div class="stat-card"><div class="value">{unique_markets}</div><div class="label">Unique Markets</div></div>
+                {stake_cards}
+                <div class="stat-card"><div class="value">{last_cycle.get('opened', 0)}</div><div class="label">Last Cycle Opens</div><div class="sub">{str(last_cycle.get('ts', ''))[:16]}</div></div>
+                <div class="stat-card"><div class="value">{last_monitor.get('closed', 0)}</div><div class="label">Last Monitor Closes</div><div class="sub">{str(last_monitor.get('ts', ''))[:16]}</div></div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>Open Trades</h2>
+            <table><tr><th>Side</th><th>City</th><th>Market</th><th>Entry</th><th>Now</th><th>Fair/Entry</th><th>Value</th><th>PnL</th><th>Reason</th><th>Opened</th></tr>
+            {open_rows if open_rows else '<tr><td colspan="10" style="color:#555;text-align:center">No open trades.</td></tr>'}</table>
+        </div>
+
+        <div class="section">
+            <h2>Closed History</h2>
+            <table><tr><th>Side</th><th>City</th><th>Market</th><th>Entry</th><th>Exit</th><th>Fair/Entry</th><th>Value</th><th>PnL</th><th>Reason</th><th>Closed</th></tr>
+            {closed_rows if closed_rows else '<tr><td colspan="10" style="color:#555;text-align:center">No closed trades.</td></tr>'}</table>
+        </div>
+
+        <div class="section">
+            <h2>Realtime Log</h2>
+            <table><tr><th>Time</th><th>Type</th><th>Message</th><th>Details</th></tr>
+            {event_rows if event_rows else '<tr><td colspan="4" style="color:#555;text-align:center">No runtime events yet.</td></tr>'}</table>
+        </div>
+    """
+    return HTML_TEMPLATE.format(
+        whales="—", trades=summary.get("total_trades", 0), volume=0, signals="—",
+        today_trades="—", today_volume=0,
+        positions=len(open_positions), high_conviction=wins,
+        main_content=main,
+        now=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
+
+def _render_strategy_report_page() -> str:
+    path = Path(__file__).parent / "reports" / "strategy_evolution_2026-05-24.md"
+    content = path.read_text() if path.exists() else "Strategy report has not been generated yet."
+    main = f"""
+        <div class="section">
+            <h2>Strategy Evolution Report</h2>
+            <div class="report-block">{content}</div>
+        </div>
+    """
+    return HTML_TEMPLATE.format(
+        whales="—", trades="—", volume=0, signals="—",
+        today_trades="—", today_volume=0,
+        positions="—", high_conviction="—",
+        main_content=main,
+        now=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
+
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
     view = request.query_params.get("view", "dashboard")
 
     if view == "paper":
         return _render_paper_portfolio()
+    elif view == "strategy1":
+        return _render_strategy_page(STRATEGY1_MODE)
+    elif view == "strategy2":
+        return _render_strategy_page(STRATEGY2_MODE)
+    elif view == "strategy3":
+        return _render_strategy_page(STRATEGY3_MODE)
+    elif view == "strategy-report":
+        return _render_strategy_report_page()
     elif view == "candidates":
         return _render_whale_candidates()
     else:

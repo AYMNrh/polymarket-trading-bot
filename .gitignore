@@ -10,11 +10,15 @@ data/*.jsonl
 data/*.json
 data/*.json.gz
 data/*.bak.*
+data/*.bak-*
 data/.last_heartbeat
 data/*.py
 data/archive/
 data/snapshots/
 data/v6_logs/
+archive/
+cloudflared
+ngrok
 
 # Runtime/local state
 .env

@@ -13,7 +13,14 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Load Telegram config from environment or config
+# Load Telegram config from .env or environment
+_env_path = Path(__file__).parent / ".env"
+if _env_path.exists():
+    for _line in _env_path.read_text().strip().splitlines():
+        if "=" in _line and not _line.strip().startswith("#"):
+            _k, _v = _line.strip().split("=", 1)
+            os.environ.setdefault(_k, _v)
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1534029247")
 

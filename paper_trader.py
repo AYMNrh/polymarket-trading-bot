@@ -33,23 +33,33 @@ PAPER_STATE_FILE = Path(__file__).parent / "data" / "paper_portfolio.json"
 PAPER_TRADES_LOG = Path(__file__).parent / "data" / "paper_trades.jsonl"
 TAIL_EXP_STATE_FILE = Path(__file__).parent / "data" / "tail_experiment_portfolio.json"
 TAIL_EXP_TRADES_LOG = Path(__file__).parent / "data" / "tail_experiment_trades.jsonl"
+STRATEGY1_MODE = "strategy-1-middle"
+STRATEGY2_MODE = "strategy-2-tail"
+STRATEGY3_MODE = "strategy-3-compound-tail"
+STRATEGY1_STATE_FILE = Path(__file__).parent / "data" / "strategy1_middle_portfolio.json"
+STRATEGY1_TRADES_LOG = Path(__file__).parent / "data" / "strategy1_middle_trades.jsonl"
+STRATEGY2_STATE_FILE = Path(__file__).parent / "data" / "strategy2_tail_portfolio.json"
+STRATEGY2_TRADES_LOG = Path(__file__).parent / "data" / "strategy2_tail_trades.jsonl"
+STRATEGY3_STATE_FILE = Path(__file__).parent / "data" / "strategy3_compound_tail_portfolio.json"
+STRATEGY3_TRADES_LOG = Path(__file__).parent / "data" / "strategy3_compound_tail_trades.jsonl"
+RUNTIME_LOG = Path(__file__).parent / "data" / "strategy_runtime.jsonl"
 FORECAST_CACHE: dict[tuple[str, str, str], Optional[float]] = {}
 
 DEFAULT_BANKROLL = 100.0
 MAX_BET = 2.0
-MIN_EV = 0.05
-EV_THRESHOLD = 0.05
+MIN_EV = 0.08    # v2: raised from 0.05 — 49.5% WR was a coin flip, filter low-quality entries
+EV_THRESHOLD = 0.08  # aligned with MIN_EV raise
 MIN_VOLUME = 200.0
 MAX_SPREAD = 0.08
 MAX_OPEN_POSITIONS = 12
 MAX_CITY_POSITIONS = 2
 EXPERIMENT_DAYS = 3
-STOP_LOSS_PCT = 90.0  # last-resort circuit breaker; trailing stop + EV flip are primary exits
+STOP_LOSS_PCT = 70.0  # v2: tightened from 90% — 72 stop_loss trades avg'd -$1.63, cut earlier
 EV_FLIP_EXIT_BUFFER = 0.02
 TAKE_PROFIT_PCT = 100.0
 TAKE_PROFIT_MAX_REMAINING_EDGE = 0.15
 HARD_TAKE_PROFIT_PCT = 400.0
-TRAILING_STOP_PCT = 45.0
+TRAILING_STOP_PCT = 55.0  # v2: raised from 45% — let winners run more, 45% was catching too early
 MIN_EDGE_FLOOR = 0.05  # lowered from 0.08 — tighter edge exhaustion tolerance
 MAX_POSITION_DAYS = 3
 # ─── V6 Tail Experiment Constants ──────────────────────────────────────────
@@ -82,6 +92,23 @@ TAIL_EXP_MARKET_COOLDOWN_MINUTES = 360       # 6h cooldown after non-resolution 
 TAIL_EXP_MAX_ENTRIES_PER_MARKET_PER_DAY = 2  # max re-entries per market per calendar day
 TAIL_EXP_SUSPICIOUS_VOLUME = 25.0            # treat $0.001 markets with volume <$25 as suspicious
 EDGE_EXHAUSTED_COOLDOWN_MINUTES = 720         # 12h cooldown after edge_exhausted (was undefined — bug fix)
+
+STRATEGY1_CITIES = {"Miami", "Houston", "Dallas", "Seattle"}
+STRATEGY1_MAX_ENTRY = 0.005
+STRATEGY1_MIN_VOLUME = 500.0
+STRATEGY1_MIN_EV_RATIO = 20.0
+STRATEGY1_FIXED_ALLOCATION = 1.0
+
+STRATEGY2_MAX_ENTRY = 0.002
+STRATEGY2_MIN_VOLUME = 10.0
+STRATEGY2_MIN_EV_RATIO = 5.0
+STRATEGY2_MIN_FORECAST_GAP_F = 7.0
+STRATEGY2_FIXED_ALLOCATION = 1.0
+
+STRATEGY3_BASE_STAKE = 1.0
+STRATEGY3_PROFIT_REINVEST_PCT = 0.50
+STRATEGY3_MAX_STAKE = 5.0
+STRATEGY3_LIQUIDITY_MULTIPLIER = 20.0
 
 WHALE_BOOST = 0.15
 WHALE_PENALTY = -0.20
@@ -208,6 +235,48 @@ def _log_trade(entry: dict, log_path: Path = None):
     log_file.parent.mkdir(exist_ok=True)
     with open(log_file, "a") as f:
         f.write(json.dumps(entry, default=str) + "\n")
+    strategy = _mode_for_log(log_file)
+    if strategy in {STRATEGY1_MODE, STRATEGY2_MODE}:
+        _log_runtime_event(
+            strategy,
+            f"TRADE_{entry.get('action', 'EVENT')}",
+            entry.get("title", "trade_event"),
+            condition_id=entry.get("condition_id"),
+            market_id=entry.get("market_id"),
+            side=entry.get("side"),
+            price=entry.get("current_price", entry.get("entry_price")),
+            entry_price=entry.get("entry_price"),
+            value=entry.get("value"),
+            pnl=entry.get("pnl"),
+            pnl_pct=entry.get("pnl_pct"),
+            close_reason=entry.get("close_reason"),
+        )
+
+
+def _mode_for_log(log_path: Path) -> str:
+    if log_path == STRATEGY1_TRADES_LOG:
+        return STRATEGY1_MODE
+    if log_path == STRATEGY2_TRADES_LOG:
+        return STRATEGY2_MODE
+    if log_path == STRATEGY3_TRADES_LOG:
+        return STRATEGY3_MODE
+    if log_path == TAIL_EXP_TRADES_LOG:
+        return "tail-experiment"
+    return "normal"
+
+
+def _log_runtime_event(strategy: str, event_type: str, message: str, **details):
+    """Append a structured event for dashboard/realtime analysis."""
+    RUNTIME_LOG.parent.mkdir(exist_ok=True)
+    event = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "strategy": strategy,
+        "event_type": event_type,
+        "message": message,
+        "details": details,
+    }
+    with open(RUNTIME_LOG, "a") as f:
+        f.write(json.dumps(event, default=str) + "\n")
 
 # =============================================================================
 # MATH
@@ -270,6 +339,22 @@ def _extract_market_date(title: str) -> str | None:
     return f"{year}-{month_map[month_name]}-{day.zfill(2)}"
 
 
+def _forecast_gap_f(forecast_temp: float | None, bucket_low: float, bucket_high: float) -> float | None:
+    """Distance from forecast to the traded bucket; zero means forecast is inside."""
+    if forecast_temp is None:
+        return None
+    ft = float(forecast_temp)
+    if bucket_low > -900 and bucket_high < 900:
+        if bucket_low <= ft <= bucket_high:
+            return 0.0
+        return min(abs(ft - bucket_low), abs(ft - bucket_high))
+    if bucket_low <= -900 and bucket_high < 900:
+        return abs(ft - bucket_high)
+    if bucket_high >= 900 and bucket_low > -900:
+        return abs(ft - bucket_low)
+    return None
+
+
 def _market_review_id(position: dict) -> str:
     """Stable identifier for deduping reviewed paper trades."""
     parts = [
@@ -280,6 +365,18 @@ def _market_review_id(position: dict) -> str:
         str(position.get("closed_at") or ""),
     ]
     return "|".join(parts)
+
+
+def _position_base_key(condition_id: str, direction: str, slug: str) -> str:
+    """Stable market/side key used only to detect an already-open position."""
+    return f"{condition_id}-{direction}" if condition_id else slug
+
+
+def _new_position_key(condition_id: str, direction: str, slug: str, entry_ts: str, sequence: int) -> str:
+    """Immutable trade key; every entry must keep its own history record."""
+    base = _position_base_key(condition_id, direction, slug)
+    safe_ts = re.sub(r"[^0-9A-Za-z]+", "", entry_ts)
+    return f"{base}-{sequence:06d}-{safe_ts}"
 
 
 def _position_pnl_metrics(side: str, shares: float, entry_price: float, current_price: float,
@@ -299,13 +396,34 @@ def _position_pnl_metrics(side: str, shares: float, entry_price: float, current_
     return round(value, 2), round(pnl, 2), round(pnl_pct, 2)
 
 
+def _position_net_pnl(position: dict) -> float:
+    exits = position.get("exits", []) or []
+    return float(position.get("pnl", 0) or 0) + sum(
+        float(exit_row.get("pnl", 0) or 0)
+        for exit_row in exits
+        if isinstance(exit_row, dict)
+    )
+
+
 class PaperTrader:
     """Paper trading engine: EV-driven with whale overlay.
     Self-learning adjusts parameters as trades resolve."""
 
     def __init__(self, bankroll: float = None, mode: str = 'normal'):
+        self.profile_mode = mode
         self.mode = mode
-        if mode == 'tail-experiment':
+        if mode == STRATEGY1_MODE:
+            self.state_file = STRATEGY1_STATE_FILE
+            self.trades_log = STRATEGY1_TRADES_LOG
+        elif mode in {STRATEGY2_MODE, STRATEGY3_MODE}:
+            if mode == STRATEGY2_MODE:
+                self.state_file = STRATEGY2_STATE_FILE
+                self.trades_log = STRATEGY2_TRADES_LOG
+            else:
+                self.state_file = STRATEGY3_STATE_FILE
+                self.trades_log = STRATEGY3_TRADES_LOG
+            self.mode = 'tail-experiment'
+        elif mode == 'tail-experiment':
             self.state_file = TAIL_EXP_STATE_FILE
             self.trades_log = TAIL_EXP_TRADES_LOG
         else:
@@ -324,6 +442,65 @@ class PaperTrader:
         if mode == 'tail-experiment':
             self.state["parameters"]["trailing_stop_pct"] = TAIL_EXP_TRAILING_PCT
             self.state['parameters']['hard_take_profit_pct'] = HARD_TAKE_PROFIT_PCT
+        if mode == STRATEGY1_MODE:
+            self.state["parameters"].update({
+                "min_ev": 0.05,
+                "max_bet": STRATEGY1_FIXED_ALLOCATION,
+                "max_price": 0.006,
+                "min_volume": STRATEGY1_MIN_VOLUME,
+                "max_positions": 8,
+                "max_city_positions": 2,
+                "kelly_fraction": 0.0,
+            })
+            self.state["experiment"] = {
+                "scope": STRATEGY1_MODE,
+                "name": "Cheap Middle Bucket Spike",
+                "rules": "BUY middle buckets only; entry <=0.5c; volume >=500; fair/entry >=20x; Miami/Houston/Dallas/Seattle.",
+                "started_at": self.state.get("created_at") or datetime.now(timezone.utc).isoformat(),
+            }
+        if mode == STRATEGY2_MODE:
+            self.state["parameters"].update({
+                "trailing_stop_pct": TAIL_EXP_TRAILING_PCT,
+                "hard_take_profit_pct": HARD_TAKE_PROFIT_PCT,
+                "max_positions": 6,
+                "max_city_positions": 2,
+                "min_volume": STRATEGY2_MIN_VOLUME,
+                "max_price": STRATEGY2_MAX_ENTRY,
+            })
+            self.state["experiment"] = {
+                "scope": STRATEGY2_MODE,
+                "name": "Ultra-Cheap Tail Spike Capture",
+                "rules": "BUY tails only; entry <=0.2c; fair/entry >=5x; forecast gap >=7F; volume >=10; staged exits at x2/x4.",
+                "started_at": self.state.get("created_at") or datetime.now(timezone.utc).isoformat(),
+            }
+        if mode == STRATEGY3_MODE:
+            self.state["parameters"].update({
+                "trailing_stop_pct": TAIL_EXP_TRAILING_PCT,
+                "hard_take_profit_pct": HARD_TAKE_PROFIT_PCT,
+                "max_positions": 6,
+                "max_city_positions": 2,
+                "min_volume": STRATEGY2_MIN_VOLUME,
+                "max_price": STRATEGY2_MAX_ENTRY,
+                "base_stake": STRATEGY3_BASE_STAKE,
+                "profit_reinvest_pct": STRATEGY3_PROFIT_REINVEST_PCT,
+                "max_stake": STRATEGY3_MAX_STAKE,
+                "liquidity_multiplier": STRATEGY3_LIQUIDITY_MULTIPLIER,
+            })
+            self.state.setdefault("stake_state", {
+                "base_stake": STRATEGY3_BASE_STAKE,
+                "current_stake": STRATEGY3_BASE_STAKE,
+                "max_stake": STRATEGY3_MAX_STAKE,
+                "profit_reinvest_pct": STRATEGY3_PROFIT_REINVEST_PCT,
+                "liquidity_multiplier": STRATEGY3_LIQUIDITY_MULTIPLIER,
+                "last_trade_pnl": 0.0,
+                "last_update_reason": "initialized",
+            })
+            self.state["experiment"] = {
+                "scope": STRATEGY3_MODE,
+                "name": "Compound Tail Stake",
+                "rules": "Strategy 2 tail entries; base $1 stake; reinvest 50% of winning profit into next stake; reset to base after losses; cap stake at $5; skip markets with volume below 20x planned stake.",
+                "started_at": self.state.get("created_at") or datetime.now(timezone.utc).isoformat(),
+            }
         self.state.setdefault('wins_real', 0)
         self.state.setdefault('wins_flat', 0)
         self.state.setdefault('losses', 0)
@@ -336,8 +513,10 @@ class PaperTrader:
             self.state["starting_bankroll"] = bankroll
         # Reconcile counters from actual position data on every load
         self.reconcile_counters(self.state)
-        reconciled = self.reconcile_bankroll(self.state)
-        if abs(reconciled - float(self.state.get("bankroll", 0))) > 0.02:
+        reconciled = float(self.state.get("bankroll", 0))
+        if self.profile_mode not in {STRATEGY1_MODE, STRATEGY2_MODE, STRATEGY3_MODE}:
+            reconciled = self.reconcile_bankroll(self.state)
+        if self.profile_mode not in {STRATEGY1_MODE, STRATEGY2_MODE, STRATEGY3_MODE} and abs(reconciled - float(self.state.get("bankroll", 0))) > 0.02:
             logger.warning("Bankroll drifted by $%.2f — reconciling from positions", 
                           reconciled - float(self.state.get("bankroll", 0)))
             self.state["bankroll"] = reconciled
@@ -345,10 +524,12 @@ class PaperTrader:
         self._update_peak_equity()
         self._open_positions = {k: v for k, v in self.state.get("positions", {}).items()
                                 if v.get("status") == "open"}
+        if self.profile_mode in {STRATEGY1_MODE, STRATEGY2_MODE, STRATEGY3_MODE}:
+            _save_state(self.state, self.state_file)
 
     def _reload(self):
         """Reload state from disk - keeps dashboard in sync with cron jobs."""
-        disk_state = _load_state()
+        disk_state = _load_state(self.state_file)
         if 'positions' in disk_state:
             self.state = disk_state
             self._open_positions = {k: v for k, v in self.state.get("positions", {}).items()
@@ -369,7 +550,12 @@ class PaperTrader:
         for pos in state.get("positions", {}).values():
             if pos.get("status") != "closed":
                 continue
-            pnl = float(pos.get("pnl", 0))
+            exits = pos.get("exits", []) or []
+            pnl = float(pos.get("pnl", 0)) + sum(
+                float(e.get("pnl", 0) or 0)
+                for e in exits
+                if isinstance(e, dict)
+            )
             outcome = pos.get("outcome_class", "")
             if pnl > 0.05 or outcome == "real_win":
                 wins += 1
@@ -677,6 +863,8 @@ class PaperTrader:
             pos["outcome_class"] = "loss"
 
         self.state["bankroll"] = round(self.state["bankroll"] + value, 2)
+        if self.profile_mode == STRATEGY3_MODE:
+            self._update_strategy3_stake(pos)
         # Reconcile all counters from actual position data (prevents drift)
         self.reconcile_counters(self.state)
 
@@ -688,7 +876,7 @@ class PaperTrader:
                 self.state["recently_edge_exhausted"][market_id] = datetime.now(timezone.utc).isoformat()
 
         # V6.1: cooldown for any non-resolution close (stops re-entry loop)
-        if self.mode == 'tail-experiment' and close_reason != "resolved":
+        if (self.mode == 'tail-experiment' or self.profile_mode == STRATEGY1_MODE) and close_reason != "resolved":
             market_id = pos.get("market_id")
             if market_id:
                 self.state.setdefault("market_close_cooldowns", {})
@@ -716,6 +904,49 @@ class PaperTrader:
             )
         logger.info("CLOSE %s via %s: $%.2f PnL", pos.get("title", "?")[:35], close_reason, pnl)
         return pos
+
+    def _update_strategy3_stake(self, pos: dict) -> None:
+        stake_state = self.state.setdefault("stake_state", {})
+        params = self.state.get("parameters", {})
+        base_stake = float(stake_state.get("base_stake", params.get("base_stake", STRATEGY3_BASE_STAKE)))
+        max_stake = float(stake_state.get("max_stake", params.get("max_stake", STRATEGY3_MAX_STAKE)))
+        reinvest_pct = float(stake_state.get(
+            "profit_reinvest_pct",
+            params.get("profit_reinvest_pct", STRATEGY3_PROFIT_REINVEST_PCT),
+        ))
+        current_stake = float(stake_state.get("current_stake", base_stake))
+        net_pnl = _position_net_pnl(pos)
+
+        if net_pnl > 0.05:
+            next_stake = min(max_stake, current_stake + net_pnl * reinvest_pct)
+            reason = "win_reinvest"
+        elif net_pnl < -0.05:
+            next_stake = base_stake
+            reason = "loss_reset"
+        else:
+            next_stake = current_stake
+            reason = "flat_hold"
+
+        stake_state.update({
+            "base_stake": round(base_stake, 2),
+            "current_stake": round(next_stake, 2),
+            "previous_stake": round(current_stake, 2),
+            "max_stake": round(max_stake, 2),
+            "profit_reinvest_pct": reinvest_pct,
+            "last_trade_pnl": round(net_pnl, 2),
+            "last_update_reason": reason,
+            "last_update_ts": datetime.now(timezone.utc).isoformat(),
+        })
+        self.state["stake_state"] = stake_state
+        _log_runtime_event(
+            STRATEGY3_MODE,
+            "STAKE_UPDATE",
+            reason,
+            pnl=round(net_pnl, 2),
+            previous_stake=round(current_stake, 2),
+            next_stake=round(next_stake, 2),
+            position_id=pos.get("position_id"),
+        )
 
     def _partial_close(self, pos_key: str, pos: dict, exit_price: float | None = None,
                        reason: str = "x2_sell") -> dict | None:
@@ -908,8 +1139,8 @@ class PaperTrader:
         current_max_positions = int(params.get('max_positions', MAX_OPEN_POSITIONS))
         current_max_city_positions = int(params.get('max_city_positions', MAX_CITY_POSITIONS))
 
-        # --- Edge exhausted market cooldown (tail-experiment) ---
-        if self.mode == 'tail-experiment':
+        # --- Edge exhausted / re-entry cooldowns ---
+        if self.mode == 'tail-experiment' or self.profile_mode == STRATEGY1_MODE:
             ee = self.state.get('recently_edge_exhausted', {})
             if market_id in ee:
                 last_ee_ts = ee[market_id]
@@ -978,6 +1209,10 @@ class PaperTrader:
         if price >= current_max_price:
             return None
 
+        # v2: Skip mid-range entries ($0.005-$0.10) — 86 trades, 64% loss rate
+        if self.profile_mode != STRATEGY1_MODE and 0.005 <= price <= 0.10 and self.mode != 'tail-experiment':
+            return None
+
         # Default fair price if not provided
         if fair_price is None:
             fair_price = self._estimate_fair_price(
@@ -1002,6 +1237,32 @@ class PaperTrader:
         if direction == 'SELL':
             return None
 
+        if self.profile_mode == STRATEGY1_MODE:
+            is_middle_bucket = (
+                'between' in title_lower
+                and 'or higher' not in title_lower
+                and 'or below' not in title_lower
+            )
+            ev_ratio = fair_price / price if price > 0 else 0.0
+            if not is_middle_bucket:
+                _log_runtime_event(self.profile_mode, "SKIP", "not_middle_bucket", title=title, city=city)
+                return None
+            if city not in STRATEGY1_CITIES:
+                _log_runtime_event(self.profile_mode, "SKIP", "city_not_in_strategy", title=title, city=city)
+                return None
+            if price > STRATEGY1_MAX_ENTRY:
+                _log_runtime_event(self.profile_mode, "SKIP", "entry_price_too_high", title=title, price=price)
+                return None
+            if volume < STRATEGY1_MIN_VOLUME:
+                _log_runtime_event(self.profile_mode, "SKIP", "volume_too_low", title=title, volume=volume)
+                return None
+            if ev_ratio < STRATEGY1_MIN_EV_RATIO:
+                _log_runtime_event(
+                    self.profile_mode, "SKIP", "ev_ratio_too_low",
+                    title=title, ev_ratio=round(ev_ratio, 2), fair_price=fair_price, price=price,
+                )
+                return None
+
         # Tail-experiment filters
         if self.mode == 'tail-experiment':
             if direction != 'BUY':
@@ -1021,8 +1282,29 @@ class PaperTrader:
             ev_ratio = fair_price / price
             if ev_ratio < TAIL_EXP_MIN_EV_RATIO:
                 return None
+            if self.profile_mode in {STRATEGY2_MODE, STRATEGY3_MODE}:
+                forecast_gap = _forecast_gap_f(forecast_temp, bucket_low, bucket_high)
+                if price > STRATEGY2_MAX_ENTRY:
+                    _log_runtime_event(self.profile_mode, "SKIP", "entry_price_too_high", title=title, price=price)
+                    return None
+                if ev_ratio < STRATEGY2_MIN_EV_RATIO:
+                    _log_runtime_event(
+                        self.profile_mode, "SKIP", "ev_ratio_too_low",
+                        title=title, ev_ratio=round(ev_ratio, 2), fair_price=fair_price, price=price,
+                    )
+                    return None
+                if forecast_gap is None or forecast_gap < STRATEGY2_MIN_FORECAST_GAP_F:
+                    _log_runtime_event(
+                        self.profile_mode, "SKIP", "forecast_gap_too_small",
+                        title=title, forecast_gap=forecast_gap, forecast_temp=forecast_temp,
+                        bucket_low=bucket_low, bucket_high=bucket_high,
+                    )
+                    return None
+                if volume < STRATEGY2_MIN_VOLUME:
+                    _log_runtime_event(self.profile_mode, "SKIP", "volume_outside_strategy", title=title, volume=volume)
+                    return None
             # V6.1: Suspicious volume check — $0.001 markets with volume <$25 may have fake MFE
-            if price <= 0.001 and volume < TAIL_EXP_SUSPICIOUS_VOLUME:
+            if self.profile_mode not in {STRATEGY2_MODE, STRATEGY3_MODE} and price <= 0.001 and volume < TAIL_EXP_SUSPICIOUS_VOLUME:
                 return None
             # Optional trade limit; continuous mode leaves this unset.
             total_trades = self.state.get("total_trades", 0)
@@ -1038,7 +1320,7 @@ class PaperTrader:
             return None
 
         # Whale gate — skipped in tail-experiment mode (pure EV trading)
-        if self.mode != 'tail-experiment':
+        if self.mode != 'tail-experiment' and self.profile_mode != STRATEGY1_MODE:
             weather_whale_count = self._count_weather_whales(whale_positions or [])
             if whale_overlay["count"] == 0 and weather_whale_count >= 3:
                 return None
@@ -1046,8 +1328,36 @@ class PaperTrader:
                 return None
 
         # Sizing
-        if self.mode == 'tail-experiment':
-            # Fixed $2 per trade for tail experiment
+        if self.profile_mode == STRATEGY1_MODE:
+            allocation = min(STRATEGY1_FIXED_ALLOCATION, current_max_bet)
+            kelly_adjusted = 0.0
+            effective_kelly_fraction = 0.0
+        elif self.profile_mode == STRATEGY2_MODE:
+            allocation = STRATEGY2_FIXED_ALLOCATION
+            kelly_adjusted = 0.0
+            effective_kelly_fraction = 0.0
+        elif self.profile_mode == STRATEGY3_MODE:
+            stake_state = self.state.setdefault("stake_state", {})
+            base_stake = float(stake_state.get("base_stake", STRATEGY3_BASE_STAKE))
+            max_stake = float(stake_state.get("max_stake", STRATEGY3_MAX_STAKE))
+            planned_stake = float(stake_state.get("current_stake", base_stake))
+            allocation = round(min(max_stake, max(base_stake, planned_stake)), 2)
+            liquidity_floor = max(STRATEGY2_MIN_VOLUME, allocation * STRATEGY3_LIQUIDITY_MULTIPLIER)
+            if volume < liquidity_floor:
+                _log_runtime_event(
+                    self.profile_mode,
+                    "SKIP",
+                    "liquidity_too_low_for_stake",
+                    title=title,
+                    volume=volume,
+                    planned_stake=allocation,
+                    required_volume=round(liquidity_floor, 2),
+                )
+                return None
+            kelly_adjusted = 0.0
+            effective_kelly_fraction = 0.0
+        elif self.mode == 'tail-experiment':
+            # Fixed allocation for tail experiment
             allocation = TAIL_EXP_FIXED_ALLOCATION
             kelly_adjusted = 0.0
             effective_kelly_fraction = 0.0
@@ -1113,7 +1423,17 @@ class PaperTrader:
             "reserved_capital": round(allocation, 2),
             "mfe_price": round(price, 4),
             "mae_price": round(price, 4),
+            "strategy_mode": self.profile_mode,
         }
+        if self.profile_mode == STRATEGY3_MODE:
+            entry["stake_plan"] = {
+                "base_stake": STRATEGY3_BASE_STAKE,
+                "planned_stake": round(allocation, 2),
+                "max_stake": STRATEGY3_MAX_STAKE,
+                "profit_reinvest_pct": STRATEGY3_PROFIT_REINVEST_PCT,
+                "liquidity_multiplier": STRATEGY3_LIQUIDITY_MULTIPLIER,
+                "required_volume": round(max(STRATEGY2_MIN_VOLUME, allocation * STRATEGY3_LIQUIDITY_MULTIPLIER), 2),
+            }
 
         # Multiple-based exit levels for tail experiment (V6)
         if self.mode == 'tail-experiment':
@@ -1131,13 +1451,17 @@ class PaperTrader:
             entry["min_hold_until"] = (datetime.now(timezone.utc) + timedelta(minutes=min_hold_val)).isoformat()
             entry["ev_ratio"] = round(ev_ratio, 2)
 
-        # Dedup by condition_id first
-        pos_key = f"{condition_id}-{direction}" if condition_id else slug
+        # Dedup only among currently open positions. New entries receive an
+        # immutable key so closed history is never overwritten on re-entry.
+        base_key = _position_base_key(condition_id, direction, slug)
         existing_key = None
-        if pos_key in self._open_positions:
-            existing_key = pos_key
-        elif slug in self._open_positions:
-            existing_key = slug
+        for open_key, open_pos in self._open_positions.items():
+            if (
+                open_pos.get("condition_id") == condition_id
+                and open_pos.get("side") == direction
+            ) or open_key == base_key or open_key == slug:
+                existing_key = open_key
+                break
 
         if existing_key:
             pos = self._open_positions[existing_key]
@@ -1169,6 +1493,10 @@ class PaperTrader:
         # Deduct bankroll on position open
         bankroll_before = round(self.state['bankroll'], 2)
         self.state['bankroll'] = round(self.state['bankroll'] - allocation, 2)
+        next_sequence = int(self.state.get("total_trades", 0)) + 1
+        pos_key = _new_position_key(condition_id, direction, slug, entry["entry_ts"], next_sequence)
+        entry["position_id"] = pos_key
+        entry["market_side_key"] = base_key
 
         # Open new position
         self.state["positions"][pos_key] = entry
@@ -1178,7 +1506,7 @@ class PaperTrader:
         _save_state(self.state, self.state_file)
 
         # V6.1: Track daily entry count for this market
-        if self.mode == 'tail-experiment' and market_id:
+        if (self.mode == 'tail-experiment' or self.profile_mode == STRATEGY1_MODE) and market_id:
             today_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             entry_counts = self.state.setdefault('market_entry_counts', {})
             current = entry_counts.get(market_id, {})
@@ -1319,7 +1647,6 @@ class PaperTrader:
             "san-francisco": "San Francisco", "london": "London",
             "paris": "Paris", "tokyo": "Tokyo", "berlin": "Berlin",
             "sydney": "Sydney", "mexico-city": "Mexico City",
-            "austin": "Austin", "lucknow": "Lucknow",
         }
         months = ["january","february","march","april","may","june",
                    "july","august","september","october","november","december"]
@@ -1624,10 +1951,22 @@ class PaperTrader:
     def summary(self) -> dict:
         """Get current portfolio summary."""
         self._reload()
-        open_positions = [p for p in self.state.get("positions", {}).values()
-                          if p.get("status") == "open"]
+        positions = list(self.state.get("positions", {}).values())
+        open_positions = [p for p in positions if p.get("status") == "open"]
+        closed_positions = [p for p in positions if p.get("status") == "closed"]
         total_value = sum(p.get("value", 0) for p in open_positions)
-        total_pnl = sum(p.get("pnl", 0) for p in open_positions)
+
+        def net_pnl(pos: dict) -> float:
+            exits = pos.get("exits", []) or []
+            return float(pos.get("pnl", 0) or 0) + sum(
+                float(e.get("pnl", 0) or 0)
+                for e in exits
+                if isinstance(e, dict)
+            )
+
+        unrealized_pnl = sum(net_pnl(p) for p in open_positions)
+        realized_pnl = sum(net_pnl(p) for p in closed_positions)
+        total_pnl = realized_pnl + unrealized_pnl
 
         return {
             "bankroll": round(self.state.get("bankroll", 0), 2),
@@ -1637,6 +1976,8 @@ class PaperTrader:
             "total_trades": self.state.get("total_trades", 0),
             "wins": self.state.get("wins", 0),
             "losses": self.state.get("losses", 0),
+            "realized_pnl": round(realized_pnl, 2),
+            "unrealized_pnl": round(unrealized_pnl, 2),
             "total_pnl": round(total_pnl, 2),
             "parameters": self.state.get("parameters", {}),
             "experiment": self.state.get("experiment", {}),
