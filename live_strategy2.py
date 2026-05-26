@@ -327,33 +327,9 @@ def _manage_exits(state: dict[str, Any]) -> dict[str, Any]:
         if pos.get("status") != "dry_run_open":
             continue
 
-        # --- Fetch current price ---
-        price = _update_position_price(pos)
-        if price is None:
-            continue
-
         entry_price = float(pos.get("entry_price", 1))
         shares = float(pos.get("shares", 0))
         stake = float(pos.get("stake", 0))
-
-        # Update position metrics
-        pos["current_price"] = price
-        value = shares * price
-        pnl = value - shares * entry_price
-        pnl_pct = (pnl / max(0.01, stake)) * 100
-        pos["value"] = round(value, 2)
-        pos["pnl"] = round(pnl, 2)
-        pos["pnl_pct"] = round(pnl_pct, 2)
-
-        # Track peak for trailing stop
-        peak = pos.get("peak_pnl_pct")
-        if peak is None or pnl_pct > peak:
-            pos["peak_pnl_pct"] = pnl_pct
-
-        # MFE tracking
-        mfe = pos.get("mfe_price")
-        if mfe is None or price > mfe:
-            pos["mfe_price"] = price
 
         # --- Check market resolution first ---
         market_id = pos.get("market_id", "")
@@ -376,6 +352,30 @@ def _manage_exits(state: dict[str, Any]) -> dict[str, Any]:
                                pnl=round(pnl_r, 2), reason="resolved",
                                market_id=market_id, title=pos.get("title", "")[:60])
                 continue
+
+        # --- Fetch executable exit price for still-open markets ---
+        price = _update_position_price(pos)
+        if price is None:
+            continue
+
+        # Update position metrics
+        pos["current_price"] = price
+        value = shares * price
+        pnl = value - shares * entry_price
+        pnl_pct = (pnl / max(0.01, stake)) * 100
+        pos["value"] = round(value, 2)
+        pos["pnl"] = round(pnl, 2)
+        pos["pnl_pct"] = round(pnl_pct, 2)
+
+        # Track peak for trailing stop
+        peak = pos.get("peak_pnl_pct")
+        if peak is None or pnl_pct > peak:
+            pos["peak_pnl_pct"] = pnl_pct
+
+        # MFE tracking
+        mfe = pos.get("mfe_price")
+        if mfe is None or price > mfe:
+            pos["mfe_price"] = price
 
         # --- Check trailing stop (activates at +50% MFE) ---
         mfe_price = pos.get("mfe_price", entry_price)

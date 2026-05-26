@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from live_strategy2 import _update_position_price
+from live_strategy2 import _manage_exits, _update_position_price
 from paper_trader import (
     _entry_price_for_side,
     _extract_bucket_bounds,
@@ -34,6 +34,37 @@ class StrategyPricingTests(unittest.TestCase):
         }
         pos = {"market_id": "123", "side": "BUY"}
         self.assertEqual(_update_position_price(pos), 0.004)
+
+    @patch("live_strategy2.requests.get")
+    def test_live_s2_resolves_closed_market_even_without_executable_bid(self, mock_get):
+        mock_get.return_value.status_code = 200
+        mock_get.return_value.json.return_value = {
+            "closed": True,
+            "bestAsk": "0.006",
+            "outcomePrices": "[\"1\", \"0\"]",
+        }
+        state = {
+            "positions": {
+                "p1": {
+                    "status": "dry_run_open",
+                    "market_id": "123",
+                    "side": "BUY",
+                    "entry_price": 0.002,
+                    "shares": 500.0,
+                    "stake": 1.0,
+                }
+            },
+            "closed_trades": 0,
+            "daily_realized_pnl": {},
+            "spent": 1.0,
+        }
+
+        stats = _manage_exits(state)
+
+        self.assertEqual(stats["resolved"], 1)
+        self.assertEqual(state["positions"]["p1"]["status"], "closed")
+        self.assertEqual(state["positions"]["p1"]["exit_price"], 1.0)
+        self.assertEqual(state["spent"], 0.0)
 
 
 if __name__ == "__main__":

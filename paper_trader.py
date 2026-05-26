@@ -752,12 +752,12 @@ class PaperTrader:
         max_price = float(params.get("max_price", 0.45))
 
         for market in markets:
-            bid = market.get("bestBid")
-            ask = market.get("bestAsk")
+            bid = _market_side_price(market, "bestBid")
+            ask = _market_side_price(market, "bestAsk")
             volume = float(market.get("volume", 0) or 0)
             if bid is not None and ask is not None and volume >= min_volume:
-                spread = float(ask) - float(bid)
-                if 0 < float(bid) < 1 and 0 < float(ask) < 1 and spread <= max_spread:
+                spread = ask - bid
+                if spread <= max_spread:
                     report["liquid_candidates"] += 1
                     fair_price = self._estimate_fair_price(
                         market.get("question", "?"),
@@ -766,12 +766,12 @@ class PaperTrader:
                         bucket_high=_extract_bucket_bounds(market.get("question", "?"))[1],
                     )
                     if fair_price is not None:
-                        edge = abs(fair_price - float(bid))
-                        if edge >= min_ev and float(bid) < max_price:
+                        edge = abs(fair_price - ask)
+                        if edge >= min_ev and ask < max_price:
                             report["ev_candidates"] += 1
                             overlay = self._check_whale_overlay(
                                 market.get("question", "?"),
-                                "BUY" if fair_price > float(bid) else "SELL",
+                                "BUY" if fair_price > ask else "SELL",
                                 whale_positions,
                             )
                             if overlay["count"] > 0:
@@ -1261,13 +1261,6 @@ class PaperTrader:
         best_bid = _market_side_price(market, "bestBid")
         best_ask = _market_side_price(market, "bestAsk")
         volume = float(market.get("volume", 0) or 0)
-        outcome_prices = market.get("outcomePrices", "[]")
-        if isinstance(outcome_prices, str):
-            try:
-                outcome_prices = json.loads(outcome_prices)
-            except Exception:
-                outcome_prices = []
-
         if best_bid is None or best_ask is None:
             return None
         price = best_ask
