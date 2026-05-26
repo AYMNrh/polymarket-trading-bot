@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Backward-compatible Hermes wrapper for Strategy 3."""
+"""Hermes no-agent wrapper for Strategy 3."""
 
 import sys
 

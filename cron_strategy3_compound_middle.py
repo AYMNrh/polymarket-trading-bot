@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Backward-compatible entrypoint for Strategy 3: compound-stake middle bucket capture."""
+"""Cron entrypoint for Strategy 3: compound-stake middle bucket capture."""
 
 import sys
 from pathlib import Path

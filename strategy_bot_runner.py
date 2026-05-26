@@ -75,7 +75,7 @@ def run_strategy(mode: str) -> dict:
     _log_runtime_event(mode, "CYCLE_START", "cycle started", equity=trader.equity())
 
     markets = trader.discover_weather_markets()
-    if mode == STRATEGY1_MODE:
+    if mode in {STRATEGY1_MODE, STRATEGY3_MODE}:
         whale_positions = _load_quality_whale_positions(scraper)
     else:
         whale_positions = _load_cached_tail_whales(trader.state_file.parent)

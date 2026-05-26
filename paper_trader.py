@@ -35,15 +35,17 @@ TAIL_EXP_STATE_FILE = Path(__file__).parent / "data" / "tail_experiment_portfoli
 TAIL_EXP_TRADES_LOG = Path(__file__).parent / "data" / "tail_experiment_trades.jsonl"
 STRATEGY1_MODE = "strategy-1-middle"
 STRATEGY2_MODE = "strategy-2-tail"
-STRATEGY3_MODE = "strategy-3-compound-tail"
+STRATEGY3_MODE = "strategy-3-compound-middle"
 STRATEGY1_STATE_FILE = Path(__file__).parent / "data" / "strategy1_middle_portfolio.json"
 STRATEGY1_TRADES_LOG = Path(__file__).parent / "data" / "strategy1_middle_trades.jsonl"
 STRATEGY2_STATE_FILE = Path(__file__).parent / "data" / "strategy2_tail_portfolio.json"
 STRATEGY2_TRADES_LOG = Path(__file__).parent / "data" / "strategy2_tail_trades.jsonl"
-STRATEGY3_STATE_FILE = Path(__file__).parent / "data" / "strategy3_compound_tail_portfolio.json"
-STRATEGY3_TRADES_LOG = Path(__file__).parent / "data" / "strategy3_compound_tail_trades.jsonl"
+STRATEGY3_STATE_FILE = Path(__file__).parent / "data" / "strategy3_compound_middle_portfolio.json"
+STRATEGY3_TRADES_LOG = Path(__file__).parent / "data" / "strategy3_compound_middle_trades.jsonl"
 RUNTIME_LOG = Path(__file__).parent / "data" / "strategy_runtime.jsonl"
-FORECAST_CACHE: dict[tuple[str, str, str], Optional[float]] = {}
+# Cache: (city, date, unit) → temp. Global flag to skip Open-Meteo if down.
+FORECAST_CACHE: dict[tuple[str, str, str], float | None] = {}
+_OPENMETEO_DOWN = False
 
 DEFAULT_BANKROLL = 100.0
 MAX_BET = 2.0
@@ -145,8 +147,46 @@ FORECAST_LOCATIONS = {
 # FORECAST FUNCTIONS
 # =============================================================================
 
+def _nws_grid_forecast(lat: float, lon: float) -> dict | None:
+    """Fetch daily high temperatures from NWS API for US locations."""
+    try:
+        # Step 1: Get grid point
+        r = requests.get(
+            f"https://api.weather.gov/points/{lat},{lon}",
+            timeout=(5, 8),
+            headers={"User-Agent": "HermesTradingBot/1.0 (aymen@github)"},
+        )
+        if r.status_code != 200:
+            return None
+        props = r.json().get("properties", {})
+        grid_id = props.get("gridId")
+        grid_x = props.get("gridX")
+        grid_y = props.get("gridY")
+        if not all([grid_id, grid_x is not None, grid_y is not None]):
+            return None
+
+        # Step 2: Get forecast
+        r = requests.get(
+            f"https://api.weather.gov/gridpoints/{grid_id}/{grid_x},{grid_y}/forecast",
+            timeout=(5, 10),
+            headers={"User-Agent": "HermesTradingBot/1.0 (aymen@github)"},
+        )
+        if r.status_code != 200:
+            return None
+        periods = r.json().get("properties", {}).get("periods", [])
+        daily_highs: dict[str, float] = {}
+        for p in periods:
+            if p.get("isDaytime", False) and p.get("temperature") is not None:
+                date_key = p.get("startTime", "")[:10]
+                daily_highs[date_key] = float(p["temperature"])
+        return daily_highs
+    except Exception:
+        return None
+
+
 def _get_forecast_temp(city: str, date_str: str, unit: str = 'F') -> Optional[float]:
-    """Fetch forecast temperature from Open-Meteo ECMWF API."""
+    """Fetch forecast temperature, with NWS fallback for US cities."""
+    global _OPENMETEO_DOWN
     cache_key = (city, date_str, unit)
     if cache_key in FORECAST_CACHE:
         return FORECAST_CACHE[cache_key]
@@ -155,25 +195,34 @@ def _get_forecast_temp(city: str, date_str: str, unit: str = 'F') -> Optional[fl
     if not loc:
         return None
     temp_unit = 'fahrenheit' if unit == 'F' else 'celsius'
-    url = (
-        f"https://api.open-meteo.com/v1/forecast"
-        f"?latitude={loc['lat']}&longitude={loc['lon']}"
-        f"&daily=temperature_2m_max&temperature_unit={temp_unit}"
-        f"&forecast_days=7&models=ecmwf_ifs025&bias_correction=true"
-    )
-    for attempt in range(2):
+
+    # Try Open-Meteo ECMWF (fast timeout — skip entirely if known to be down)
+    if not _OPENMETEO_DOWN:
         try:
-            data = requests.get(url, timeout=(5, 10)).json()
+            url = (
+                f"https://api.open-meteo.com/v1/forecast"
+                f"?latitude={loc['lat']}&longitude={loc['lon']}"
+                f"&daily=temperature_2m_max&temperature_unit={temp_unit}"
+                f"&forecast_days=7&models=ecmwf_ifs025&bias_correction=true"
+            )
+            data = requests.get(url, timeout=(2, 3)).json()
             if 'error' not in data:
                 for d, t in zip(data['daily']['time'], data['daily']['temperature_2m_max']):
                     if d == date_str and t is not None:
                         result = round(t) if unit == 'F' else round(t, 1)
                         FORECAST_CACHE[cache_key] = result
                         return result
-            break
         except Exception:
-            if attempt < 1:
-                time.sleep(2)
+            _OPENMETEO_DOWN = True  # Skip Open-Meteo for remaining calls
+
+    # Fallback: NWS API for US cities (Fahrenheit only)
+    if loc.get("region") == "us" and unit == "F":
+        daily_highs = _nws_grid_forecast(loc["lat"], loc["lon"])
+        if daily_highs and date_str in daily_highs:
+            result = round(daily_highs[date_str])
+            FORECAST_CACHE[cache_key] = result
+            return result
+
     FORECAST_CACHE[cache_key] = None
     return None
 
@@ -303,12 +352,17 @@ def _kelly_size(kelly: float, bankroll: float) -> float:
 def _extract_bucket_bounds(title: str) -> tuple[float, float]:
     """Parse the traded temperature bucket from a market title."""
     bucket_low, bucket_high = 0.0, 0.0
-    temp_match = re.findall(r'(\d+)\s*[Â°F]', title)
-    if len(temp_match) >= 2:
-        bucket_low = float(temp_match[-2])
-        bucket_high = float(temp_match[-1])
-    elif len(temp_match) == 1:
-        bucket_low = bucket_high = float(temp_match[0])
+    range_match = re.search(r'(\d+)\s*-\s*(\d+)\s*[°Â]?[FC]', title)
+    if range_match:
+        bucket_low = float(range_match.group(1))
+        bucket_high = float(range_match.group(2))
+    else:
+        temp_match = re.findall(r'(\d+)\s*[°Â]?[FC]', title)
+        if len(temp_match) >= 2:
+            bucket_low = float(temp_match[-2])
+            bucket_high = float(temp_match[-1])
+        elif len(temp_match) == 1:
+            bucket_low = bucket_high = float(temp_match[0])
 
     title_lower = title.lower()
     if 'or below' in title_lower:
@@ -316,6 +370,31 @@ def _extract_bucket_bounds(title: str) -> tuple[float, float]:
     if 'or higher' in title_lower or 'or above' in title_lower:
         bucket_low, bucket_high = bucket_low or 0.0, 999.0
     return bucket_low, bucket_high
+
+
+def _market_side_price(market: dict, field: str) -> float | None:
+    value = market.get(field)
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return None
+    if price <= 0 or price >= 1:
+        return None
+    return price
+
+
+def _entry_price_for_side(market: dict, side: str) -> float | None:
+    """Return the executable entry price for the requested side."""
+    if side == "BUY":
+        return _market_side_price(market, "bestAsk")
+    return _market_side_price(market, "bestBid")
+
+
+def _mark_price_for_side(market: dict, side: str) -> float | None:
+    """Return the executable mark/exit price for the requested side."""
+    if side == "BUY":
+        return _market_side_price(market, "bestBid")
+    return _market_side_price(market, "bestAsk")
 
 
 def _extract_market_date(title: str) -> str | None:
@@ -415,14 +494,13 @@ class PaperTrader:
         if mode == STRATEGY1_MODE:
             self.state_file = STRATEGY1_STATE_FILE
             self.trades_log = STRATEGY1_TRADES_LOG
-        elif mode in {STRATEGY2_MODE, STRATEGY3_MODE}:
-            if mode == STRATEGY2_MODE:
-                self.state_file = STRATEGY2_STATE_FILE
-                self.trades_log = STRATEGY2_TRADES_LOG
-            else:
-                self.state_file = STRATEGY3_STATE_FILE
-                self.trades_log = STRATEGY3_TRADES_LOG
+        elif mode == STRATEGY2_MODE:
+            self.state_file = STRATEGY2_STATE_FILE
+            self.trades_log = STRATEGY2_TRADES_LOG
             self.mode = 'tail-experiment'
+        elif mode == STRATEGY3_MODE:
+            self.state_file = STRATEGY3_STATE_FILE
+            self.trades_log = STRATEGY3_TRADES_LOG
         elif mode == 'tail-experiment':
             self.state_file = TAIL_EXP_STATE_FILE
             self.trades_log = TAIL_EXP_TRADES_LOG
@@ -475,12 +553,13 @@ class PaperTrader:
             }
         if mode == STRATEGY3_MODE:
             self.state["parameters"].update({
-                "trailing_stop_pct": TAIL_EXP_TRAILING_PCT,
-                "hard_take_profit_pct": HARD_TAKE_PROFIT_PCT,
-                "max_positions": 6,
+                "min_ev": 0.05,
+                "max_bet": STRATEGY3_MAX_STAKE,
+                "max_price": 0.006,
+                "min_volume": STRATEGY1_MIN_VOLUME,
+                "max_positions": 8,
                 "max_city_positions": 2,
-                "min_volume": STRATEGY2_MIN_VOLUME,
-                "max_price": STRATEGY2_MAX_ENTRY,
+                "kelly_fraction": 0.0,
                 "base_stake": STRATEGY3_BASE_STAKE,
                 "profit_reinvest_pct": STRATEGY3_PROFIT_REINVEST_PCT,
                 "max_stake": STRATEGY3_MAX_STAKE,
@@ -497,8 +576,8 @@ class PaperTrader:
             })
             self.state["experiment"] = {
                 "scope": STRATEGY3_MODE,
-                "name": "Compound Tail Stake",
-                "rules": "Strategy 2 tail entries; base $1 stake; reinvest 50% of winning profit into next stake; reset to base after losses; cap stake at $5; skip markets with volume below 20x planned stake.",
+                "name": "Compound Middle Bucket Stake",
+                "rules": "Strategy 1 middle-bucket entries; base $1 stake; reinvest 50% of winning profit into next stake; reset to base after losses; cap stake at $5; skip markets with volume below 20x planned stake.",
                 "started_at": self.state.get("created_at") or datetime.now(timezone.utc).isoformat(),
             }
         self.state.setdefault('wins_real', 0)
@@ -875,8 +954,9 @@ class PaperTrader:
                 self.state.setdefault("recently_edge_exhausted", {})
                 self.state["recently_edge_exhausted"][market_id] = datetime.now(timezone.utc).isoformat()
 
-        # V6.1: cooldown for any non-resolution close (stops re-entry loop)
-        if (self.mode == 'tail-experiment' or self.profile_mode == STRATEGY1_MODE) and close_reason != "resolved":
+        # V6.1: cooldown for tail markets only. Middle-bucket strategies are
+        # allowed to repeatedly harvest the same market while it qualifies.
+        if self.mode == 'tail-experiment' and close_reason != "resolved":
             market_id = pos.get("market_id")
             if market_id:
                 self.state.setdefault("market_close_cooldowns", {})
@@ -1140,7 +1220,7 @@ class PaperTrader:
         current_max_city_positions = int(params.get('max_city_positions', MAX_CITY_POSITIONS))
 
         # --- Edge exhausted / re-entry cooldowns ---
-        if self.mode == 'tail-experiment' or self.profile_mode == STRATEGY1_MODE:
+        if self.mode == 'tail-experiment':
             ee = self.state.get('recently_edge_exhausted', {})
             if market_id in ee:
                 last_ee_ts = ee[market_id]
@@ -1178,8 +1258,8 @@ class PaperTrader:
                 if market_today.get("count", 0) >= TAIL_EXP_MAX_ENTRIES_PER_MARKET_PER_DAY:
                     return None
 
-        best_bid = market.get("bestBid")
-        best_ask = market.get("bestAsk")
+        best_bid = _market_side_price(market, "bestBid")
+        best_ask = _market_side_price(market, "bestAsk")
         volume = float(market.get("volume", 0) or 0)
         outcome_prices = market.get("outcomePrices", "[]")
         if isinstance(outcome_prices, str):
@@ -1188,14 +1268,9 @@ class PaperTrader:
             except Exception:
                 outcome_prices = []
 
-        # Use best bid as conservative entry price
-        price = float(best_bid) if best_bid is not None else (float(best_ask) if best_ask is not None else None)
-        if not price or price <= 0 or price >= 1:
-            return None
-
-        # Skip if no real bid/ask (no liquidity)
         if best_bid is None or best_ask is None:
             return None
+        price = best_ask
         spread = float(best_ask) - float(best_bid)
         if spread > current_max_spread:
             return None
@@ -1210,7 +1285,7 @@ class PaperTrader:
             return None
 
         # v2: Skip mid-range entries ($0.005-$0.10) — 86 trades, 64% loss rate
-        if self.profile_mode != STRATEGY1_MODE and 0.005 <= price <= 0.10 and self.mode != 'tail-experiment':
+        if self.profile_mode not in {STRATEGY1_MODE, STRATEGY3_MODE} and 0.005 <= price <= 0.10 and self.mode != 'tail-experiment':
             return None
 
         # Default fair price if not provided
@@ -1237,7 +1312,7 @@ class PaperTrader:
         if direction == 'SELL':
             return None
 
-        if self.profile_mode == STRATEGY1_MODE:
+        if self.profile_mode in {STRATEGY1_MODE, STRATEGY3_MODE}:
             is_middle_bucket = (
                 'between' in title_lower
                 and 'or higher' not in title_lower
@@ -1320,7 +1395,7 @@ class PaperTrader:
             return None
 
         # Whale gate — skipped in tail-experiment mode (pure EV trading)
-        if self.mode != 'tail-experiment' and self.profile_mode != STRATEGY1_MODE:
+        if self.mode != 'tail-experiment' and self.profile_mode not in {STRATEGY1_MODE, STRATEGY3_MODE}:
             weather_whale_count = self._count_weather_whales(whale_positions or [])
             if whale_overlay["count"] == 0 and weather_whale_count >= 3:
                 return None
@@ -1342,7 +1417,7 @@ class PaperTrader:
             max_stake = float(stake_state.get("max_stake", STRATEGY3_MAX_STAKE))
             planned_stake = float(stake_state.get("current_stake", base_stake))
             allocation = round(min(max_stake, max(base_stake, planned_stake)), 2)
-            liquidity_floor = max(STRATEGY2_MIN_VOLUME, allocation * STRATEGY3_LIQUIDITY_MULTIPLIER)
+            liquidity_floor = max(STRATEGY1_MIN_VOLUME, allocation * STRATEGY3_LIQUIDITY_MULTIPLIER)
             if volume < liquidity_floor:
                 _log_runtime_event(
                     self.profile_mode,
@@ -1432,7 +1507,7 @@ class PaperTrader:
                 "max_stake": STRATEGY3_MAX_STAKE,
                 "profit_reinvest_pct": STRATEGY3_PROFIT_REINVEST_PCT,
                 "liquidity_multiplier": STRATEGY3_LIQUIDITY_MULTIPLIER,
-                "required_volume": round(max(STRATEGY2_MIN_VOLUME, allocation * STRATEGY3_LIQUIDITY_MULTIPLIER), 2),
+                "required_volume": round(max(STRATEGY1_MIN_VOLUME, allocation * STRATEGY3_LIQUIDITY_MULTIPLIER), 2),
             }
 
         # Multiple-based exit levels for tail experiment (V6)
@@ -1465,12 +1540,15 @@ class PaperTrader:
 
         if existing_key:
             pos = self._open_positions[existing_key]
-            pos["current_price"] = price
+            mark_price = _mark_price_for_side(market, pos.get("side", "BUY"))
+            if mark_price is None:
+                mark_price = float(pos.get("current_price", pos.get("entry_price", price)))
+            pos["current_price"] = mark_price
             value, pnl, pnl_pct = _position_pnl_metrics(
                 pos.get('side', 'BUY'),
                 float(pos.get('shares', 0)),
                 float(pos.get('entry_price', 0)),
-                float(price),
+                float(mark_price),
                 pos.get('reserved_capital'),
             )
             pos['value'] = value
@@ -1478,7 +1556,7 @@ class PaperTrader:
             pos["pnl_pct"] = pnl_pct
             # MFE/MAE tracking for experiment mode
             if self.mode == 'tail-experiment':
-                current_p = float(price)
+                current_p = float(mark_price)
                 mfe = pos.get('mfe_price')
                 mae = pos.get('mae_price')
                 if mfe is None or current_p > mfe:
@@ -1506,7 +1584,7 @@ class PaperTrader:
         _save_state(self.state, self.state_file)
 
         # V6.1: Track daily entry count for this market
-        if (self.mode == 'tail-experiment' or self.profile_mode == STRATEGY1_MODE) and market_id:
+        if self.mode == 'tail-experiment' and market_id:
             today_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             entry_counts = self.state.setdefault('market_entry_counts', {})
             current = entry_counts.get(market_id, {})
@@ -1643,7 +1721,7 @@ class PaperTrader:
             "new-york": "NYC", "chicago": "Chicago", "miami": "Miami",
             "dallas": "Dallas", "denver": "Denver", "seattle": "Seattle",
             "atlanta": "Atlanta", "boston": "Boston", "phoenix": "Phoenix",
-            "houston": "Houston",
+            "houston": "Houston", "austin": "Austin",
             "san-francisco": "San Francisco", "london": "London",
             "paris": "Paris", "tokyo": "Tokyo", "berlin": "Berlin",
             "sydney": "Sydney", "mexico-city": "Mexico City",
@@ -1819,9 +1897,9 @@ class PaperTrader:
                     timeout=5
                 )
                 data = r.json()
-                prices_str = data.get('outcomePrices', '[0.5,0.5]')
-                prices = json.loads(prices_str)
-                price = float(prices[0])
+                price = _mark_price_for_side(data, pos.get('side', 'BUY'))
+                if price is None:
+                    continue
                 pos['current_price'] = price
                 value, pnl, pnl_pct = _position_pnl_metrics(
                     pos.get('side', 'BUY'),

@@ -26,6 +26,7 @@ from position_tracker import PositionTracker
 from self_learning import SelfLearningEngine
 from onchain_decoder import OnChainTradeDecoder
 from polymarket_scraper import PolymarketScraper
+from live_strategy2 import load_live_events, load_live_state
 from paper_trader import STRATEGY1_MODE, STRATEGY2_MODE, STRATEGY3_MODE, RUNTIME_LOG, PaperTrader
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="refresh" content="30">
     <title>🐋 Whale Tracker</title>
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
@@ -119,6 +121,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <a href="/?view=paper">Paper Portfolio</a>
             <a href="/?view=strategy1">Strategy 1</a>
             <a href="/?view=strategy2">Strategy 2</a>
+            <a href="/?view=live-strategy2">Live S2 Test</a>
             <a href="/?view=strategy3">Strategy 3</a>
             <a href="/?view=strategy-report">Strategy Report</a>
         </div>
@@ -1053,6 +1056,45 @@ def _position_net_pnl(pos: dict) -> float:
     return float(pos.get("pnl", 0) or 0) + sum(float(e.get("pnl", 0) or 0) for e in exits if isinstance(e, dict))
 
 
+def _render_city_performance_table(positions: list[dict]) -> str:
+    city_stats = {}
+    for pos in positions:
+        city = pos.get("city") or "Unknown"
+        stats = city_stats.setdefault(
+            city,
+            {"open": 0, "closed": 0, "wins": 0, "losses": 0, "flats": 0, "pnl": 0.0, "volume": 0.0},
+        )
+        pnl = _position_net_pnl(pos)
+        stats["pnl"] += pnl
+        stats["volume"] += float(pos.get("value", 0) or 0)
+        if pos.get("status") == "open":
+            stats["open"] += 1
+        else:
+            stats["closed"] += 1
+            if pnl > 0.05:
+                stats["wins"] += 1
+            elif pnl < -0.05:
+                stats["losses"] += 1
+            else:
+                stats["flats"] += 1
+
+    rows = ""
+    for city, stats in sorted(city_stats.items(), key=lambda item: item[1]["pnl"], reverse=True):
+        decided = stats["wins"] + stats["losses"]
+        win_rate = stats["wins"] / max(1, decided) * 100
+        pnl_cls = "positive" if stats["pnl"] >= 0 else "negative"
+        rows += (
+            f"<tr><td>{city}</td>"
+            f"<td>{stats['open']}</td>"
+            f"<td>{stats['closed']}</td>"
+            f"<td>{stats['wins']}/{stats['losses']}/{stats['flats']}</td>"
+            f"<td>{win_rate:.0f}%</td>"
+            f"<td>${stats['volume']:.2f}</td>"
+            f"<td class='{pnl_cls}'>${stats['pnl']:+.2f}</td></tr>"
+        )
+    return rows
+
+
 def _load_runtime_events(strategy: str, limit: int = 60) -> list[dict]:
     if not RUNTIME_LOG.exists():
         return []
@@ -1124,6 +1166,7 @@ def _render_strategy_page(mode: str) -> str:
 
     open_rows = "".join(position_row(p) for p in sorted(open_positions, key=_position_net_pnl, reverse=True))
     closed_rows = "".join(position_row(p, closed=True) for p in closed_positions[:80])
+    city_rows = _render_city_performance_table(positions)
 
     event_rows = ""
     for event in _load_runtime_events(mode):
@@ -1181,6 +1224,12 @@ def _render_strategy_page(mode: str) -> str:
         </div>
 
         <div class="section">
+            <h2>City Performance</h2>
+            <table><tr><th>City</th><th>Open</th><th>Closed</th><th>W/L/F</th><th>Win Rate</th><th>Allocated</th><th>Total PnL</th></tr>
+            {city_rows if city_rows else '<tr><td colspan="7" style="color:#555;text-align:center">No city data yet.</td></tr>'}</table>
+        </div>
+
+        <div class="section">
             <h2>Realtime Log</h2>
             <table><tr><th>Time</th><th>Type</th><th>Message</th><th>Details</th></tr>
             {event_rows if event_rows else '<tr><td colspan="4" style="color:#555;text-align:center">No runtime events yet.</td></tr>'}</table>
@@ -1190,6 +1239,159 @@ def _render_strategy_page(mode: str) -> str:
         whales="—", trades=summary.get("total_trades", 0), volume=0, signals="—",
         today_trades="—", today_volume=0,
         positions=len(open_positions), high_conviction=wins,
+        main_content=main,
+        now=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
+
+def _render_live_strategy2_page() -> str:
+    state = load_live_state()
+    config = state.get("config", {})
+    positions = list(state.get("positions", {}).values())
+    open_positions = [p for p in positions if p.get("status") == "dry_run_open"]
+    closed_positions = [p for p in positions if p.get("status") == "closed"]
+    last_cycle = state.get("last_cycle", {})
+    spent = float(state.get("spent", 0) or 0)
+    bankroll_limit = float(config.get("bankroll_limit", 20) or 20)
+    remaining = max(0.0, bankroll_limit - spent)
+    closed_trades = int(state.get("closed_trades", 0) or 0)
+    max_trades = int(config.get("max_trades", 20) or 20)
+    daily_pnl = state.get("daily_realized_pnl", {})
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today_realized = float(daily_pnl.get(today, 0) or 0)
+    daily_max = float(config.get("daily_max_loss", 5) or 5)
+    daily_remaining = max(0.0, daily_max - abs(min(0, today_realized)))
+
+    exit_stats = last_cycle.get("exits", {}) if isinstance(last_cycle, dict) else {}
+
+    def position_row(p: dict) -> str:
+        pnl = float(p.get("pnl", 0) or 0)
+        pnl_cls = "positive" if pnl >= 0 else "negative"
+        pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+        entry = float(p.get("entry_price", 0) or 0)
+        current = float(p.get("current_price", entry) or entry)
+        peak = p.get("peak_pnl_pct")
+        peak_str = f" peak={peak:.0f}%" if peak is not None else ""
+        return (
+            f"<tr><td>{p.get('city', '')}</td>"
+            f"<td style='font-size:0.85em'>{p.get('title', '?')[:55]}</td>"
+            f"<td>{entry:.4f}</td>"
+            f"<td>{current:.4f}</td>"
+            f"<td>{float(p.get('ev_ratio', 0) or 0):.1f}x</td>"
+            f"<td>{float(p.get('forecast_gap', 0) or 0):.1f}°F</td>"
+            f"<td>${float(p.get('stake', 0) or 0):.2f}</td>"
+            f"<td class='{pnl_cls}'>{pnl_str}</td>"
+            f"<td style='font-size:0.8em;color:#555'>{peak_str}</td>"
+            f"<td>{str(p.get('opened_at', ''))[:16]}</td></tr>"
+        )
+
+    open_rows = "".join(
+        position_row(p) for p in sorted(open_positions, key=lambda x: x.get("opened_at", ""), reverse=True)
+    )
+
+    def closed_row(p: dict) -> str:
+        pnl = float(p.get("pnl", 0) or 0)
+        pnl_cls = "positive" if pnl >= 0 else "negative"
+        pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+        return (
+            f"<tr><td>{p.get('city', '')}</td>"
+            f"<td style='font-size:0.85em'>{p.get('title', '?')[:55]}</td>"
+            f"<td>${float(p.get('entry_price', 0) or 0):.4f}</td>"
+            f"<td>${float(p.get('exit_price', 0) or 0):.4f}</td>"
+            f"<td class='{pnl_cls}'>{pnl_str}</td>"
+            f"<td>{p.get('close_reason', '?')}</td>"
+            f"<td>{str(p.get('closed_at', ''))[:16]}</td></tr>"
+        )
+
+    closed_rows = "".join(
+        closed_row(p) for p in sorted(closed_positions, key=lambda x: x.get("closed_at", ""), reverse=True)
+    )
+
+    event_rows = ""
+    for event in load_live_events():
+        details = event.get("details", {})
+        event_rows += (
+            f"<tr><td>{str(event.get('ts', ''))[:19]}</td>"
+            f"<td><span class='badge badge-signal'>{event.get('event_type', '')}</span></td>"
+            f"<td>{event.get('message', '')}</td>"
+            f"<td style='font-family:monospace;font-size:0.8em;color:#888'>{json.dumps(details, default=str)[:260]}</td></tr>"
+        )
+
+    skip_reasons = last_cycle.get("skip_reasons", {}) if isinstance(last_cycle, dict) else {}
+    skip_rows = "".join(
+        f"<tr><td>{reason}</td><td>{count}</td></tr>"
+        for reason, count in sorted(skip_reasons.items(), key=lambda item: item[1], reverse=True)
+    )
+    scan_by_city = last_cycle.get("scan_by_city", {}) if isinstance(last_cycle, dict) else {}
+    city_scan_rows = ""
+    for city, stats in sorted(scan_by_city.items(), key=lambda item: (item[1].get("would_buy", 0), item[1].get("candidates", 0), item[1].get("scanned", 0)), reverse=True):
+        skips = stats.get("skips", {}) if isinstance(stats.get("skips", {}), dict) else {}
+        top_skip = ""
+        if skips:
+            top_skip = max(skips.items(), key=lambda item: item[1])[0]
+        city_scan_rows += (
+            f"<tr><td>{city}</td>"
+            f"<td>{stats.get('scanned', 0)}</td>"
+            f"<td>{stats.get('candidates', 0)}</td>"
+            f"<td>{stats.get('would_buy', 0)}</td>"
+            f"<td>{stats.get('blocked', 0)}</td>"
+            f"<td>{top_skip}</td></tr>"
+        )
+
+    mode_label = "DRY RUN" if config.get("dry_run", True) else "LIVE"
+    main = f"""
+        <div class="section">
+            <h2>Live Strategy 2 Test</h2>
+            <p style="color:#888;margin-bottom:16px">Strategy 2 tail buckets, $1 stake, max 10 positions, ${daily_max:.0f} daily loss stop, {max_trades} trade limit.</p>
+            <div class="stats">
+                <div class="stat-card"><div class="value">{mode_label}</div><div class="label">Mode</div></div>
+                <div class="stat-card"><div class="value">${bankroll_limit:.2f}</div><div class="label">Bankroll Cap</div></div>
+                <div class="stat-card"><div class="value">${float(config.get('stake', 1) or 1):.2f}</div><div class="label">Stake Per Trade</div></div>
+                <div class="stat-card"><div class="value">{len(open_positions)}/{int(config.get('max_open_positions', 10) or 10)}</div><div class="label">Open Positions</div></div>
+                <div class="stat-card"><div class="value">${spent:.2f}</div><div class="label">Allocated</div></div>
+                <div class="stat-card"><div class="value">${remaining:.2f}</div><div class="label">Remaining Cap</div></div>
+                <div class="stat-card"><div class="value" style="color:{'#ff6b6b' if today_realized < 0 else '#00d4aa'}">${today_realized:+.2f}</div><div class="label">Today PnL</div><div class="sub">limit ${daily_max:.2f}, ${daily_remaining:.2f} remaining</div></div>
+                <div class="stat-card"><div class="value">{closed_trades}/{max_trades}</div><div class="label">Closed Trades</div></div>
+                <div class="stat-card"><div class="value">{exit_stats.get('closed', 0)}</div><div class="label">Last Cycle Exits</div><div class="sub">{exit_stats.get('resolved', 0)} resolved, {exit_stats.get('trailing_stops', 0)} trailing</div></div>
+                <div class="stat-card"><div class="value">{last_cycle.get('would_buy', 0)}</div><div class="label">Last Cycle Opens</div><div class="sub">{str(last_cycle.get('ts', ''))[:16]}</div></div>
+                <div class="stat-card"><div class="value">{last_cycle.get('candidates', 0)}</div><div class="label">Last Cycle Candidates</div></div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>Open Positions ({len(open_positions)})</h2>
+            <table><tr><th>City</th><th>Market</th><th>Entry</th><th>Now</th><th>Fair/Entry</th><th>Gap</th><th>Stake</th><th>PnL</th><th>Peak</th><th>Opened</th></tr>
+            {open_rows if open_rows else '<tr><td colspan="10" style="color:#555;text-align:center">No open positions.</td></tr>'}</table>
+        </div>
+
+        <div class="section">
+            <h2>Closed Positions ({len(closed_positions)})</h2>
+            <table><tr><th>City</th><th>Market</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Reason</th><th>Closed</th></tr>
+            {closed_rows if closed_rows else '<tr><td colspan="7" style="color:#555;text-align:center">No closed positions yet.</td></tr>'}</table>
+        </div>
+
+        <div class="section">
+            <h2>Last Scan Skips</h2>
+            <table><tr><th>Reason</th><th>Count</th></tr>
+            {skip_rows if skip_rows else '<tr><td colspan="2" style="color:#555;text-align:center">No scan yet.</td></tr>'}</table>
+        </div>
+
+        <div class="section">
+            <h2>Scan By City</h2>
+            <table><tr><th>City</th><th>Scanned</th><th>Candidates</th><th>WOULD_BUY</th><th>Blocked</th><th>Top Skip</th></tr>
+            {city_scan_rows if city_scan_rows else '<tr><td colspan="6" style="color:#555;text-align:center">No city scan data yet.</td></tr>'}</table>
+        </div>
+
+        <div class="section">
+            <h2>Live Test Log</h2>
+            <table><tr><th>Time</th><th>Type</th><th>Message</th><th>Details</th></tr>
+            {event_rows if event_rows else '<tr><td colspan="4" style="color:#555;text-align:center">No live test events yet.</td></tr>'}</table>
+        </div>
+    """
+    return HTML_TEMPLATE.format(
+        whales="—", trades=state.get("closed_trades", 0), volume=spent, signals=last_cycle.get("candidates", 0),
+        today_trades="—", today_volume=0,
+        positions=len(open_positions), high_conviction=last_cycle.get("would_buy", 0),
         main_content=main,
         now=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     )
@@ -1223,6 +1425,8 @@ async def dashboard(request: Request):
         return _render_strategy_page(STRATEGY1_MODE)
     elif view == "strategy2":
         return _render_strategy_page(STRATEGY2_MODE)
+    elif view == "live-strategy2":
+        return _render_live_strategy2_page()
     elif view == "strategy3":
         return _render_strategy_page(STRATEGY3_MODE)
     elif view == "strategy-report":

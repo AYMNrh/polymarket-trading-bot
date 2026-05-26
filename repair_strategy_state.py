@@ -19,6 +19,7 @@ from paper_trader import (
     STRATEGY1_TRADES_LOG,
     STRATEGY2_STATE_FILE,
     STRATEGY2_TRADES_LOG,
+    STRATEGY3_MODE,
     STRATEGY3_STATE_FILE,
     STRATEGY3_TRADES_LOG,
     PaperTrader,
@@ -144,7 +145,7 @@ def main() -> int:
     jobs = [
         (STRATEGY1_STATE_FILE, STRATEGY1_TRADES_LOG, "strategy-1-middle"),
         (STRATEGY2_STATE_FILE, STRATEGY2_TRADES_LOG, "strategy-2-tail"),
-        (STRATEGY3_STATE_FILE, STRATEGY3_TRADES_LOG, "strategy-3-compound-tail"),
+        (STRATEGY3_STATE_FILE, STRATEGY3_TRADES_LOG, STRATEGY3_MODE),
     ]
     for state_path, log_path, mode in jobs:
         repaired = repair_state(state_path, log_path, mode)
