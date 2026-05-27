@@ -397,6 +397,14 @@ def _mark_price_for_side(market: dict, side: str) -> float | None:
     return _market_side_price(market, "bestAsk")
 
 
+def _conservative_mark_price_for_side(market: dict, side: str) -> float | None:
+    """Return liquidation value; a missing BUY bid is worth zero for risk."""
+    price = _mark_price_for_side(market, side)
+    if price is None and side == "BUY":
+        return 0.0
+    return price
+
+
 def _extract_market_date(title: str) -> str | None:
     """Extract YYYY-MM-DD market date from the title when available."""
     title_lower = title.lower()
@@ -1533,7 +1541,7 @@ class PaperTrader:
 
         if existing_key:
             pos = self._open_positions[existing_key]
-            mark_price = _mark_price_for_side(market, pos.get("side", "BUY"))
+            mark_price = _conservative_mark_price_for_side(market, pos.get("side", "BUY"))
             if mark_price is None:
                 mark_price = float(pos.get("current_price", pos.get("entry_price", price)))
             pos["current_price"] = mark_price
@@ -1890,7 +1898,7 @@ class PaperTrader:
                     timeout=5
                 )
                 data = r.json()
-                price = _mark_price_for_side(data, pos.get('side', 'BUY'))
+                price = _conservative_mark_price_for_side(data, pos.get('side', 'BUY'))
                 if price is None:
                     continue
                 pos['current_price'] = price

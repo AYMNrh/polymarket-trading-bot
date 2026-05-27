@@ -21,8 +21,10 @@ from paper_trader import (
     STRATEGY2_MIN_EV_RATIO,
     STRATEGY2_MIN_FORECAST_GAP_F,
     STRATEGY2_MIN_VOLUME,
+    STOP_LOSS_PCT,
     PaperTrader,
     _entry_price_for_side,
+    _conservative_mark_price_for_side,
     _extract_bucket_bounds,
     _extract_market_date,
     _forecast_gap_f,
@@ -222,6 +224,9 @@ def _candidate_from_market(trader: PaperTrader, market: dict[str, Any]) -> tuple
     price = _entry_price_for_side(market, "BUY")
     if price is None:
         return None, "missing_best_ask"
+    exit_price = _mark_price_for_side(market, "BUY")
+    if exit_price is None:
+        return None, "missing_best_bid"
     if price > STRATEGY2_MAX_ENTRY:
         return None, "entry_price_too_high"
 
@@ -288,7 +293,7 @@ def _update_position_price(pos: dict) -> float | None:
         if r.status_code != 200:
             return None
         data = r.json()
-        return _mark_price_for_side(data, pos.get("side", "BUY"))
+        return _conservative_mark_price_for_side(data, pos.get("side", "BUY"))
     except Exception:
         return None
 
@@ -322,6 +327,7 @@ def _manage_exits(state: dict[str, Any]) -> dict[str, Any]:
     closed_count = 0
     resolved_count = 0
     trailing_count = 0
+    stop_loss_count = 0
 
     for pos_key, pos in list(state.get("positions", {}).items()):
         if pos.get("status") != "dry_run_open":
@@ -382,6 +388,19 @@ def _manage_exits(state: dict[str, Any]) -> dict[str, Any]:
         mfe_mfe_pct = ((mfe_price - entry_price) / max(0.0001, entry_price)) * 100
         hit_mfe_protect = mfe_mfe_pct >= MFE_ACTIVATE_PCT
 
+        if not hit_mfe_protect and pnl_pct <= -STOP_LOSS_PCT:
+            pos["exit_price"] = price
+            pos["close_reason"] = "stop_loss"
+            pos["status"] = "closed"
+            pos["closed_at"] = datetime.now(timezone.utc).isoformat()
+            _record_close(state, pos, pnl)
+            closed_count += 1
+            stop_loss_count += 1
+            log_live_event("CLOSED", "stop loss hit", position_id=pos_key,
+                           pnl=round(pnl, 2), pnl_pct=round(pnl_pct, 1),
+                           reason="stop_loss", market_id=market_id)
+            continue
+
         if hit_mfe_protect:
             peak_pnl = pos.get("peak_pnl_pct", pnl_pct)
             if peak_pnl > 0 and pnl_pct < peak_pnl * (1 - TRAILING_STOP_PCT / 100):
@@ -398,6 +417,7 @@ def _manage_exits(state: dict[str, Any]) -> dict[str, Any]:
     return {
         "closed": closed_count + trailing_count + resolved_count,
         "trailing_stops": trailing_count,
+        "stop_losses": stop_loss_count,
         "resolved": resolved_count,
     }
 
