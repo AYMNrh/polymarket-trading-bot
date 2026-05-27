@@ -164,8 +164,9 @@ class StrategyPricingTests(unittest.TestCase):
         self.assertIsNone(candidate)
         self.assertEqual(reason, "missing_best_bid")
 
+    @patch("live_ab_strategies.log_ab_event")
     @patch("live_ab_strategies.quote_yes_market")
-    def test_ab_exit_missing_bid_marks_buy_position_at_zero(self, mock_quote):
+    def test_ab_exit_missing_bid_marks_buy_position_at_zero(self, mock_quote, _mock_log):
         mock_quote.return_value = quote_from_book(
             "token-1",
             {"bids": [], "asks": [{"price": "0.002", "size": "10"}]},

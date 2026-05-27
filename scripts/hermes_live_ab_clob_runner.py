@@ -10,6 +10,10 @@ ROOT_CANDIDATES = (
     Path(__file__).resolve().parents[1],
 )
 ROOT = next((path for path in ROOT_CANDIDATES if (path / "live_ab_strategies.py").exists()), Path.cwd())
+
+script_dir = str(Path(__file__).resolve().parent)
+if script_dir in sys.path:
+    sys.path.remove(script_dir)
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
