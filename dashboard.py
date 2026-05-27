@@ -26,6 +26,7 @@ from position_tracker import PositionTracker
 from self_learning import SelfLearningEngine
 from onchain_decoder import OnChainTradeDecoder
 from polymarket_scraper import PolymarketScraper
+from live_ab_strategies import load_ab_events, load_ab_state, STRATEGY_A, STRATEGY_B
 from live_strategy2 import load_live_events, load_live_state
 from paper_trader import STRATEGY1_MODE, STRATEGY2_MODE, STRATEGY3_MODE, RUNTIME_LOG, PaperTrader
 
@@ -122,6 +123,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <a href="/?view=strategy1">Strategy 1</a>
             <a href="/?view=strategy2">Strategy 2</a>
             <a href="/?view=live-strategy2">Live S2 Test</a>
+            <a href="/?view=live-ab">Live AB CLOB</a>
             <a href="/?view=strategy3">Strategy 3</a>
             <a href="/?view=strategy-report">Strategy Report</a>
         </div>
@@ -1415,6 +1417,141 @@ def _render_strategy_report_page() -> str:
     )
 
 
+def _render_live_ab_page() -> str:
+    state = load_ab_state()
+    config = state.get("config", {})
+    positions = list(state.get("positions", {}).values())
+    open_positions = [p for p in positions if p.get("status") in {"dry_run_open", "live_open"}]
+    closed_positions = [p for p in positions if p.get("status") == "closed"]
+    last_cycle = state.get("last_cycle", {})
+    by_strategy = last_cycle.get("by_strategy", {}) if isinstance(last_cycle, dict) else {}
+    spent = float(state.get("spent", 0) or 0)
+    bankroll_limit = float(config.get("bankroll_limit", 20) or 20)
+    daily_pnl = state.get("daily_realized_pnl", {})
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today_realized = float(daily_pnl.get(today, 0) or 0)
+
+    def _strategy_cards() -> str:
+        cards = ""
+        for strategy, label in ((STRATEGY_A, "A Middle"), (STRATEGY_B, "B Tail Below")):
+            stats = by_strategy.get(strategy, {})
+            open_count = sum(1 for p in open_positions if p.get("strategy") == strategy)
+            closed_count = sum(1 for p in closed_positions if p.get("strategy") == strategy)
+            pnl = sum(float(p.get("pnl", 0) or 0) for p in positions if p.get("strategy") == strategy)
+            cards += f"""
+                <div class="stat-card"><div class="value">{label}</div><div class="label">Strategy</div><div class="sub">{strategy}</div></div>
+                <div class="stat-card"><div class="value">{stats.get('candidates', 0)}</div><div class="label">{label} Candidates</div><div class="sub">watched {stats.get('watched', 0)}, opened {stats.get('would_buy', 0)}</div></div>
+                <div class="stat-card"><div class="value">{open_count}/{closed_count}</div><div class="label">{label} Open/Closed</div></div>
+                <div class="stat-card"><div class="value" style="color:{'#00d4aa' if pnl >= 0 else '#ff6b6b'}">${pnl:+.2f}</div><div class="label">{label} PnL</div></div>
+            """
+        return cards
+
+    def _position_row(p: dict, closed: bool = False) -> str:
+        pnl = float(p.get("pnl", 0) or 0)
+        pnl_cls = "positive" if pnl >= 0 else "negative"
+        when = p.get("closed_at") if closed else p.get("opened_at")
+        display_price = float((p.get("exit_price") if closed else p.get("current_price")) or 0)
+        return (
+            f"<tr><td>{'A' if p.get('strategy') == STRATEGY_A else 'B'}</td>"
+            f"<td>{p.get('city', '')}</td>"
+            f"<td style='font-size:0.85em'>{p.get('title', '?')[:70]}</td>"
+            f"<td>${float(p.get('entry_price', 0) or 0):.4f}</td>"
+            f"<td>${display_price:.4f}</td>"
+            f"<td>{float(p.get('forecast_gap', 0) or 0):.1f}°F</td>"
+            f"<td>${float(p.get('stake', 0) or 0):.2f}</td>"
+            f"<td class='{pnl_cls}'>${pnl:+.2f}</td>"
+            f"<td>{p.get('close_reason', 'open')}</td>"
+            f"<td>{str(when or '')[:16]}</td></tr>"
+        )
+
+    open_rows = "".join(_position_row(p) for p in sorted(open_positions, key=lambda x: x.get("opened_at", ""), reverse=True))
+    closed_rows = "".join(_position_row(p, closed=True) for p in sorted(closed_positions, key=lambda x: x.get("closed_at", ""), reverse=True)[:80])
+
+    skip_reasons = last_cycle.get("skip_reasons", {}) if isinstance(last_cycle, dict) else {}
+    skip_rows = "".join(
+        f"<tr><td>{reason}</td><td>{count}</td></tr>"
+        for reason, count in sorted(skip_reasons.items(), key=lambda item: item[1], reverse=True)[:25]
+    )
+
+    candidate_rows = ""
+    for c in (last_cycle.get("sample_candidates", []) if isinstance(last_cycle, dict) else [])[-25:][::-1]:
+        candidate_rows += (
+            f"<tr><td>{'A' if c.get('strategy') == STRATEGY_A else 'B'}</td>"
+            f"<td>{c.get('city', '')}</td>"
+            f"<td style='font-size:0.85em'>{c.get('title', '')[:70]}</td>"
+            f"<td>${float(c.get('entry_price', 0) or 0):.4f}</td>"
+            f"<td>${float(c.get('exit_bid', 0) or 0):.4f}</td>"
+            f"<td>{float(c.get('spread', 0) or 0):.4f}</td>"
+            f"<td>{float(c.get('forecast_gap', 0) or 0):.1f}°F</td>"
+            f"<td>{c.get('price_source', '')}</td></tr>"
+        )
+
+    event_rows = ""
+    for event in load_ab_events():
+        details = event.get("details", {})
+        event_rows += (
+            f"<tr><td>{str(event.get('ts', ''))[:19]}</td>"
+            f"<td><span class='badge badge-signal'>{event.get('event_type', '')}</span></td>"
+            f"<td>{event.get('message', '')}</td>"
+            f"<td style='font-family:monospace;font-size:0.8em;color:#888'>{json.dumps(details, default=str)[:300]}</td></tr>"
+        )
+
+    main = f"""
+        <div class="section">
+            <h2>Live AB CLOB Pilot</h2>
+            <p style="color:#888;margin-bottom:16px">Wallet-ready dry-run. Entries use CLOB best ask, exits use CLOB best bid, and missing bids mark BUY positions at zero.</p>
+            <div class="stats">
+                <div class="stat-card"><div class="value">{'DRY RUN' if config.get('dry_run', True) else 'LIVE'}</div><div class="label">Mode</div></div>
+                <div class="stat-card"><div class="value">${bankroll_limit:.2f}</div><div class="label">Bankroll Cap</div></div>
+                <div class="stat-card"><div class="value">${float(config.get('stake', 1) or 1):.2f}</div><div class="label">Stake</div></div>
+                <div class="stat-card"><div class="value">{len(open_positions)}/{int(config.get('max_open_positions', 3) or 3)}</div><div class="label">Open Positions</div></div>
+                <div class="stat-card"><div class="value">${spent:.2f}</div><div class="label">Allocated</div></div>
+                <div class="stat-card"><div class="value" style="color:{'#00d4aa' if today_realized >= 0 else '#ff6b6b'}">${today_realized:+.2f}</div><div class="label">Today PnL</div></div>
+                <div class="stat-card"><div class="value">{last_cycle.get('scanned', 0)}</div><div class="label">Last Scan Markets</div><div class="sub">{str(last_cycle.get('ts', ''))[:16]}</div></div>
+                <div class="stat-card"><div class="value">{len(state.get('watchlist', {}))}</div><div class="label">Watchlist Entries</div></div>
+                {_strategy_cards()}
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>Open Positions</h2>
+            <table><tr><th>Strat</th><th>City</th><th>Market</th><th>Entry Ask</th><th>Exit Bid</th><th>Gap</th><th>Stake</th><th>PnL</th><th>Reason</th><th>Opened</th></tr>
+            {open_rows if open_rows else '<tr><td colspan="10" style="color:#555;text-align:center">No open positions.</td></tr>'}</table>
+        </div>
+
+        <div class="section">
+            <h2>Closed Positions</h2>
+            <table><tr><th>Strat</th><th>City</th><th>Market</th><th>Entry Ask</th><th>Exit Bid</th><th>Gap</th><th>Stake</th><th>PnL</th><th>Reason</th><th>Closed</th></tr>
+            {closed_rows if closed_rows else '<tr><td colspan="10" style="color:#555;text-align:center">No closed positions.</td></tr>'}</table>
+        </div>
+
+        <div class="section">
+            <h2>Latest Passing Candidates</h2>
+            <table><tr><th>Strat</th><th>City</th><th>Market</th><th>Ask</th><th>Bid</th><th>Spread</th><th>Gap</th><th>Source</th></tr>
+            {candidate_rows if candidate_rows else '<tr><td colspan="8" style="color:#555;text-align:center">No passing candidates in the latest scan.</td></tr>'}</table>
+        </div>
+
+        <div class="section">
+            <h2>Skip Reasons</h2>
+            <table><tr><th>Reason</th><th>Count</th></tr>
+            {skip_rows if skip_rows else '<tr><td colspan="2" style="color:#555;text-align:center">No scan data.</td></tr>'}</table>
+        </div>
+
+        <div class="section">
+            <h2>Realtime Log</h2>
+            <table><tr><th>Time</th><th>Type</th><th>Message</th><th>Details</th></tr>
+            {event_rows if event_rows else '<tr><td colspan="4" style="color:#555;text-align:center">No AB events yet.</td></tr>'}</table>
+        </div>
+    """
+    return HTML_TEMPLATE.format(
+        whales="—", trades=state.get("closed_trades", 0), volume=spent, signals=sum(v.get("candidates", 0) for v in by_strategy.values()) if by_strategy else 0,
+        today_trades="—", today_volume=0,
+        positions=len(open_positions), high_conviction=sum(v.get("would_buy", 0) for v in by_strategy.values()) if by_strategy else 0,
+        main_content=main,
+        now=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
+
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
     view = request.query_params.get("view", "dashboard")
@@ -1427,6 +1564,8 @@ async def dashboard(request: Request):
         return _render_strategy_page(STRATEGY2_MODE)
     elif view == "live-strategy2":
         return _render_live_strategy2_page()
+    elif view == "live-ab":
+        return _render_live_ab_page()
     elif view == "strategy3":
         return _render_strategy_page(STRATEGY3_MODE)
     elif view == "strategy-report":

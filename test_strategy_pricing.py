@@ -2,6 +2,8 @@ import unittest
 from unittest.mock import patch
 
 from live_strategy2 import _candidate_from_market, _manage_exits, _update_position_price
+from clob_pricing import quote_from_book
+from live_ab_strategies import STRATEGY_A, evaluate_strategy_a, manage_ab_exits
 from paper_trader import (
     _conservative_mark_price_for_side,
     _entry_price_for_side,
@@ -125,6 +127,66 @@ class StrategyPricingTests(unittest.TestCase):
         }
 
         stats = _manage_exits(state)
+
+        self.assertEqual(stats["stop_losses"], 1)
+        self.assertEqual(state["positions"]["p1"]["status"], "closed")
+        self.assertEqual(state["positions"]["p1"]["exit_price"], 0.0)
+        self.assertEqual(state["spent"], 0.0)
+
+    def test_clob_quote_uses_min_ask_and_max_bid_not_first_row(self):
+        quote = quote_from_book(
+            "token-1",
+            {
+                "bids": [{"price": "0.001", "size": "2"}, {"price": "0.004", "size": "3"}],
+                "asks": [{"price": "0.999", "size": "1"}, {"price": "0.002", "size": "4"}],
+            },
+        )
+
+        self.assertEqual(quote.best_bid, 0.004)
+        self.assertEqual(quote.best_ask, 0.002)
+        self.assertEqual(quote.bid_size, 3.0)
+        self.assertEqual(quote.ask_size, 4.0)
+
+    def test_ab_strategy_requires_real_exit_bid(self):
+        market = {
+            "question": "Will the lowest temperature in Miami be between 84-85°F on May 27?",
+            "city": "Miami",
+            "date": "2026-05-27",
+            "volume": 1000,
+            "conditionId": "abc",
+            "id": "123",
+        }
+        quote = quote_from_book("token-1", {"bids": [], "asks": [{"price": "0.001", "size": "10"}]})
+
+        with patch("live_ab_strategies._get_forecast_temp", return_value=87):
+            candidate, reason = evaluate_strategy_a(market, quote)
+
+        self.assertIsNone(candidate)
+        self.assertEqual(reason, "missing_best_bid")
+
+    @patch("live_ab_strategies.quote_yes_market")
+    def test_ab_exit_missing_bid_marks_buy_position_at_zero(self, mock_quote):
+        mock_quote.return_value = quote_from_book(
+            "token-1",
+            {"bids": [], "asks": [{"price": "0.002", "size": "10"}]},
+        )
+        state = {
+            "positions": {
+                "p1": {
+                    "status": "dry_run_open",
+                    "strategy": STRATEGY_A,
+                    "token_id": "token-1",
+                    "entry_price": 0.002,
+                    "shares": 500.0,
+                    "stake": 1.0,
+                }
+            },
+            "closed_trades": 0,
+            "daily_realized_pnl": {},
+            "spent": 1.0,
+        }
+
+        stats = manage_ab_exits(state)
 
         self.assertEqual(stats["stop_losses"], 1)
         self.assertEqual(state["positions"]["p1"]["status"], "closed")

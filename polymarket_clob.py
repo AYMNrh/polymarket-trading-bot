@@ -1,16 +1,14 @@
 """
 Polymarket API client — fetches market data, prices, and order book info.
-Uses Gamma API (gamma-api.polymarket.com) for market discovery and pricing.
-CLOB API (clob.polymarket.com) used only for /markets listing (non-book endpoints).
-
-The CLOB /book endpoint is deprecated/returns 404 as of May 2026.
-Gamma API provides bestBid/bestAsk via its /markets endpoint.
+Uses Gamma API (gamma-api.polymarket.com) for market discovery and metadata.
+Uses CLOB /book for executable bid/ask quotes.
 """
 import json
 import logging
 from typing import Optional
 
 import requests
+from clob_pricing import fetch_book
 
 logger = logging.getLogger(__name__)
 
@@ -100,23 +98,11 @@ class PolymarketClobClient:
             }
         return None
 
-    # ============ ORDER BOOK (via Gamma) ============
+    # ============ ORDER BOOK (CLOB executable source) ============
 
     def get_order_book(self, token_id: str) -> dict | None:
-        """
-        Get order book data for a token.
-        CLOB /book endpoint is dead (returns 404).
-        We get bestBid/bestAsk from Gamma API instead.
-
-        Returns a synthetic book with the top level only:
-        {
-          "bids": [{"price": str(best_bid), "size": "1"}],
-          "asks": [{"price": str(best_ask), "size": "1"}]
-        }
-        For real multi-level book, this is a limitation.
-        """
-        logger.warning("CLOB /book endpoint is deprecated. Using Gamma bestBid/bestAsk instead.")
-        return None
+        """Get raw executable order book data for a token from CLOB /book."""
+        return fetch_book(token_id, session=self._session)
 
     def get_best_bid_ask(self, condition_id: str) -> tuple | None:
         """Get best bid/ask from Gamma API by condition ID."""
