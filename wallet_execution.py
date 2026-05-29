@@ -105,6 +105,55 @@ class PolymarketExecutionAdapter:
             "exchange_result": result,
         }
 
+    def place_limit_sell(self, *, token_id: str, price: float, shares: float, metadata: dict[str, Any]) -> dict[str, Any]:
+        if self.config.dry_run or not self.config.live_enabled:
+            return {
+                "dry_run": True,
+                "status": "accepted",
+                "side": "SELL",
+                "token_id": token_id,
+                "price": round(float(price), 6),
+                "shares": round(float(shares), 4),
+                "metadata": metadata,
+            }
+
+        self._require_live_ready()
+        try:
+            from py_clob_client.client import ClobClient
+            from py_clob_client.clob_types import OrderArgs
+            from py_clob_client.constants import POLYGON
+        except ImportError as exc:
+            raise ExecutionDisabled(
+                "Install py-clob-client before enabling real Polymarket orders."
+            ) from exc
+
+        client = ClobClient(
+            "https://clob.polymarket.com",
+            key=self.config.private_key,
+            chain_id=POLYGON if self.config.chain_id == 137 else self.config.chain_id,
+            funder=self.config.funder,
+        )
+        client.set_api_creds(client.create_or_derive_api_creds())
+        order = client.create_order(
+            OrderArgs(
+                price=float(price),
+                size=float(shares),
+                side="SELL",
+                token_id=str(token_id),
+            )
+        )
+        result = client.post_order(order)
+        return {
+            "dry_run": False,
+            "status": "submitted",
+            "side": "SELL",
+            "token_id": token_id,
+            "price": round(float(price), 6),
+            "shares": round(float(shares), 4),
+            "metadata": metadata,
+            "exchange_result": result,
+        }
+
     def _require_live_ready(self) -> None:
         if not self.config.live_enabled:
             raise ExecutionDisabled("POLYMARKET_LIVE_TRADING must be true for real orders.")
