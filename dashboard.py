@@ -15,9 +15,9 @@ from datetime import datetime
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
-from arb_bot import load_state as load_arb_state, run_once as run_arb_once
-from btc_5m_bot import load_state as load_btc_state, run_once as run_btc_once
-from wallet_tracker import load_state as load_wallet_state, scan_wallets
+from arb_bot import load_state as load_arb_state
+from btc_5m_bot import load_state as load_btc_state
+from wallet_tracker import load_state as load_wallet_state
 
 app = FastAPI(title="Polymarket Live Trading")
 
@@ -71,11 +71,7 @@ def stat_cards(items: list[tuple[str, str, str | None, str | None]]) -> str:
 
 
 def render_btc() -> HTMLResponse:
-    try:
-        state = run_btc_once()
-    except Exception:
-        state = load_btc_state()
-        state["last_error"] = state.get("last_error") or "runtime error; check logs"
+    state = load_btc_state()
     cycle = state.get("current_cycle")
     body = stat_cards([
         ("Mode", "LIVE" if state.get("live_enabled") else "DRY/RISK-GATED", "warn" if not state.get("live_enabled") else "pos", None),
@@ -109,11 +105,7 @@ def render_btc() -> HTMLResponse:
 
 
 def render_arbitrage() -> HTMLResponse:
-    try:
-        state = run_arb_once()
-    except Exception:
-        state = load_arb_state()
-        state["last_error"] = state.get("last_error") or "runtime error; check logs"
+    state = load_arb_state()
     opps = state.get("opportunities", [])
     open_positions = [p for p in state.get("positions", []) if p.get("status") == "open"]
     body = stat_cards([
@@ -142,11 +134,7 @@ def render_arbitrage() -> HTMLResponse:
 
 
 def render_wallets() -> HTMLResponse:
-    try:
-        state = scan_wallets()
-    except Exception:
-        state = load_wallet_state()
-        state["last_error"] = state.get("last_error") or "runtime error; check logs"
+    state = load_wallet_state()
     signals = state.get("signals", [])
     body = stat_cards([
         ("Tracked Wallets", str(len(state.get("wallets", []))), None, "edit data/watch_wallets.json"),
