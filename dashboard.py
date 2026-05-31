@@ -16,7 +16,8 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
 from arb_bot import load_state as load_arb_state
-from btc_5m_bot import load_state as load_btc_state
+from btc_5m_bot import load_state as load_btc_state, LOOKAHEAD_SECONDS as BTC_LOOKAHEAD
+from btc_eth_15m_bot import load_state as load_15m_state, LAST_N_SECONDS
 from wallet_tracker import load_state as load_wallet_state
 
 app = FastAPI(title="Polymarket Live Trading")
@@ -50,6 +51,7 @@ def page(title: str, body: str) -> HTMLResponse:
     nav = """
     <div class="nav">
       <a href="/">BTC 5m</a>
+      <a href="/?view=15m">15m BTC/ETH</a>
       <a href="/?view=arbitrage">Arbitrage</a>
       <a href="/?view=wallets">Wallets</a>
       <a href="/?view=status">Status</a>
@@ -72,36 +74,87 @@ def stat_cards(items: list[tuple[str, str, str | None, str | None]]) -> str:
 
 def render_btc() -> HTMLResponse:
     state = load_btc_state()
-    cycle = state.get("current_cycle")
+    trades = state.get("trades", [])
+    last_signal = state.get("last_signal", {})
+
     body = stat_cards([
-        ("Mode", "LIVE" if state.get("live_enabled") else "DRY/RISK-GATED", "warn" if not state.get("live_enabled") else "pos", None),
         ("Bankroll", money(state.get("bankroll", 100)), None, "starts at $100"),
         ("Equity", money(state.get("equity", 100)), None, None),
         ("Total PnL", f"{float(state.get('total_pnl', 0) or 0):+.2f}", "pos" if float(state.get("total_pnl", 0) or 0) >= 0 else "neg", None),
-        ("Cycles", str(state.get("total_cycles", 0)), None, f"{state.get('win_count',0)}W/{state.get('loss_count',0)}L"),
+        ("Trades", str(state.get("total_trades", 0)), None, f"{state.get('win_count',0)}W/{state.get('loss_count',0)}L"),
+        ("Open Trades", str(len([t for t in trades if t.get('status')=='open'])), None, None),
         ("Last Scan", esc((state.get("last_scan") or "")[:19]), None, None),
     ])
     if state.get("last_error"):
-        body += f"<div class='card error' style='margin-top:12px'>Source/error: {esc(state['last_error'])}</div>"
-    body += "<h2>Current BTC 5m Cycle</h2>"
-    if cycle:
-        body += "<table><tr><th>Market</th><th>Status</th><th>UP</th><th>DOWN</th><th>Sold</th><th>PnL</th><th>Opened</th></tr>"
-        body += (
-            f"<tr><td>{esc(cycle.get('question') or cycle.get('slug'))}</td><td>{esc(cycle.get('status'))}</td>"
-            f"<td>{cycle.get('up_current')} / entry {cycle.get('up_entry')}</td>"
-            f"<td>{cycle.get('down_current')} / entry {cycle.get('down_entry')}</td>"
-            f"<td>UP {cycle.get('up_sold')} · DOWN {cycle.get('down_sold')}</td>"
-            f"<td class='{ 'pos' if float(cycle.get('pnl',0) or 0) >= 0 else 'neg'}'>{float(cycle.get('pnl',0) or 0):+.2f}</td>"
-            f"<td>{esc((cycle.get('opened_at') or '')[:19])}</td></tr></table>"
-        )
+        body += f"<div class='card error' style='margin-top:12px'>Error: {esc(state['last_error'])}</div>"
+
+    # Last signal
+    body += "<h2>Last Signal</h2>"
+    if last_signal:
+        if last_signal.get("executed"):
+            body += f"<div class='card pos'>BUY {esc(last_signal['winner'])} @ ${last_signal['buy_price']} ({last_signal['profit_pct']}% profit) - {last_signal['seconds_left']}s left</div>"
+        else:
+            up_ask = last_signal.get('up_ask')
+            down_ask = last_signal.get('down_ask')
+            up_str = f"${up_ask:.2f}" if up_ask is not None else "?"
+            down_str = f"${down_ask:.2f}" if down_ask is not None else "?"
+            body += f"<div class='card warn'>Waiting: {esc(last_signal.get('reason','?'))} (UP {up_str} DOWN {down_str})</div>"
     else:
-        body += "<div class='card muted'>No open BTC 5m cycle.</div>"
-    body += "<h2>Recent BTC Cycles</h2><table><tr><th>Market</th><th>Reason</th><th>PnL</th><th>Closed</th></tr>"
-    for row in list(state.get("past_cycles", []))[-20:][::-1]:
-        pnl = float(row.get("pnl", 0) or 0)
-        body += f"<tr><td>{esc(row.get('question') or row.get('slug'))}</td><td>{esc(row.get('close_reason'))}</td><td class='{ 'pos' if pnl >= 0 else 'neg'}'>{pnl:+.2f}</td><td>{esc((row.get('closed_at') or '')[:19])}</td></tr>"
+        body += "<div class='card muted'>No signal yet – waiting for windows near resolution.</div>"
+
+    # Open trades
+    open_trades = [t for t in trades if t.get("status") == "open"]
+    body += "<h2>Open Trades</h2><table><tr><th>Window</th><th>Side</th><th>Buy Price</th><th>Shares</th><th>Cost</th><th>Expected PnL</th><th>Entered</th></tr>"
+    for t in open_trades:
+        body += (
+            f"<tr><td>{esc(t.get('question','')[:50])}</td>"
+            f"<td class='pos'>{t.get('winner')}</td>"
+            f"<td>${t.get('buy_price')}</td>"
+            f"<td>{t.get('shares')}</td>"
+            f"<td>{money(t.get('cost'))}</td>"
+            f"<td class='pos'>{money(t.get('expected_profit'))}</td>"
+            f"<td>{esc((t.get('entry_time') or '')[:19])}</td></tr>"
+        )
+    if not open_trades:
+        body += "<tr><td colspan='7' class='muted'>No open trades.</td></tr>"
     body += "</table>"
-    return page("BTC 5m Up/Down Straddle", body)
+
+    # Trade history
+    closed_trades = [t for t in trades if t.get("status") == "closed"]
+    if closed_trades:
+        body += "<h2>Recent Trades</h2><table><tr><th>Window</th><th>Side</th><th>Buy</th><th>PnL</th><th>Closed</th></tr>"
+        for t in list(closed_trades)[-10:][::-1]:
+            pnl = float(t.get("actual_pnl", 0) or 0)
+            body += (
+                f"<tr><td>{esc(t.get('question','')[:50])}</td>"
+                f"<td>{t.get('winner')}</td>"
+                f"<td>${t.get('buy_price')}</td>"
+                f"<td class='{'pos' if pnl>=0 else 'neg'}'>{money(pnl)}</td>"
+                f"<td>{esc((t.get('exit_time') or '')[:19])}</td></tr>"
+            )
+        body += "</table>"
+
+    # Upcoming windows
+    windows = state.get("active_windows_summary", [])
+    body += "<h2>Upcoming 5m Windows</h2><table><tr><th>Window</th><th>Time Left</th><th>Volume</th><th>UP Ask</th><th>DOWN Ask</th></tr>"
+    for w in windows[:20]:
+        secs = w.get("seconds_left", 0)
+        mins = secs // 60
+        secs_rem = secs % 60
+        time_str = f"{mins}m {secs_rem}s"
+        is_near = secs <= BTC_LOOKAHEAD
+        row_cls = " class='pos'" if is_near else ""
+        body += (
+            f"<tr{row_cls}>"
+            f"<td>{esc(w.get('question','')[:50])}</td>"
+            f"<td>{time_str}</td>"
+            f"<td>{money(w.get('volume'))}</td>"
+            f"<td>${w.get('up_ask','?'):.2f}</td>"
+            f"<td>${w.get('down_ask','?'):.2f}</td></tr>"
+        )
+    body += "</table>"
+
+    return page("BTC 5m Buy-Winner-Late", body)
 
 
 def render_arbitrage() -> HTMLResponse:
@@ -154,6 +207,91 @@ def render_wallets() -> HTMLResponse:
     return page("Wallet Copy Tracker", body)
 
 
+def render_15m() -> HTMLResponse:
+    state = load_15m_state()
+    windows = state.get("active_windows_summary", [])
+    trades = state.get("trades", [])
+    last_signal = state.get("last_signal", {})
+
+    body = stat_cards([
+        ("Bankroll", money(state.get("bankroll", 100)), None, "starts at $100"),
+        ("Equity", money(state.get("equity", 100)), None, None),
+        ("Total PnL", f"{float(state.get('total_pnl',0) or 0):+.2f}", "pos" if float(state.get("total_pnl",0) or 0) >= 0 else "neg", None),
+        ("Trades", str(state.get("total_trades", 0)), None, f"{state.get('win_count',0)}W/{state.get('loss_count',0)}L"),
+        ("Open Trades", str(len([t for t in trades if t.get('status')=='open'])), None, None),
+        ("Last Scan", esc((state.get("last_scan") or "")[:19]), None, None),
+    ])
+    if state.get("last_error"):
+        body += f"<div class='card error' style='margin-top:12px'>Error: {esc(state['last_error'])}</div>"
+
+    # Last signal
+    body += "<h2>Last Signal</h2>"
+    if last_signal:
+        if last_signal.get("executed"):
+            body += f"<div class='card pos'>BUY {esc(last_signal['winner'])} @ ${last_signal['buy_price']} ({last_signal['profit_pct']}% profit) - {last_signal['seconds_left']}s left</div>"
+        else:
+            up_ask = last_signal.get('up_ask')
+            down_ask = last_signal.get('down_ask')
+            up_str = f"${up_ask:.2f}" if up_ask is not None else "?"
+            down_str = f"${down_ask:.2f}" if down_ask is not None else "?"
+            body += f"<div class='card warn'>Waiting: {esc(last_signal.get('reason','?'))} (UP {up_str} DOWN {down_str})</div>"
+    else:
+        body += "<div class='card muted'>No signal yet – waiting for windows near resolution.</div>"
+
+    # Open trades
+    open_trades = [t for t in trades if t.get("status") == "open"]
+    body += "<h2>Open Trades</h2><table><tr><th>Window</th><th>Side</th><th>Buy Price</th><th>Shares</th><th>Cost</th><th>Expected PnL</th><th>Entered</th></tr>"
+    for t in open_trades:
+        body += (
+            f"<tr><td>{esc(t.get('question','')[:50])}</td>"
+            f"<td class='pos'>{t.get('winner')}</td>"
+            f"<td>${t.get('buy_price')}</td>"
+            f"<td>{t.get('shares')}</td>"
+            f"<td>{money(t.get('cost'))}</td>"
+            f"<td class='pos'>{money(t.get('expected_profit'))}</td>"
+            f"<td>{esc((t.get('entry_time') or '')[:19])}</td></tr>"
+        )
+    if not open_trades:
+        body += "<tr><td colspan='7' class='muted'>No open trades.</td></tr>"
+    body += "</table>"
+
+    # Trade history
+    closed_trades = [t for t in trades if t.get("status") == "closed"]
+    if closed_trades:
+        body += "<h2>Recent Trades</h2><table><tr><th>Window</th><th>Side</th><th>Buy</th><th>PnL</th><th>Closed</th></tr>"
+        for t in list(closed_trades)[-10:][::-1]:
+            pnl = float(t.get("actual_pnl", 0) or 0)
+            body += (
+                f"<tr><td>{esc(t.get('question','')[:50])}</td>"
+                f"<td>{t.get('winner')}</td>"
+                f"<td>${t.get('buy_price')}</td>"
+                f"<td class='{'pos' if pnl>=0 else 'neg'}'>{money(pnl)}</td>"
+                f"<td>{esc((t.get('exit_time') or '')[:19])}</td></tr>"
+            )
+        body += "</table>"
+
+    # Upcoming windows
+    body += "<h2>Upcoming 15m Windows</h2><table><tr><th>Window</th><th>Time Left</th><th>Volume</th><th>UP Ask</th><th>DOWN Ask</th></tr>"
+    for w in windows[:20]:
+        secs = w.get("seconds_left", 0)
+        mins = secs // 60
+        secs_rem = secs % 60
+        time_str = f"{mins}m {secs_rem}s"
+        is_near = secs <= LAST_N_SECONDS
+        row_cls = " class='pos'" if is_near else ""
+        body += (
+            f"<tr{row_cls}>"
+            f"<td>{esc(w.get('question','')[:50])}</td>"
+            f"<td>{time_str}</td>"
+            f"<td>{money(w.get('volume'))}</td>"
+            f"<td>${w.get('up_ask','?'):.2f}</td>"
+            f"<td>${w.get('down_ask','?'):.2f}</td></tr>"
+        )
+    body += "</table>"
+
+    return page("15m BTC/ETH Buy-Winner-Late", body)
+
+
 def render_status() -> HTMLResponse:
     btc = load_btc_state()
     arb = load_arb_state()
@@ -174,6 +312,8 @@ async def root(view: str = "btc"):
         return render_wallets()
     if view == "status":
         return render_status()
+    if view == "15m":
+        return render_15m()
     return render_btc()
 
 
