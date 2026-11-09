@@ -18,6 +18,7 @@ from fastapi.responses import HTMLResponse
 from arb_bot import load_state as load_arb_state
 from btc_5m_bot import load_state as load_btc_state, LOOKAHEAD_SECONDS as BTC_LOOKAHEAD
 from btc_eth_15m_bot import load_state as load_15m_state, LAST_N_SECONDS
+from shadow_15m_strategies import STRATEGIES as SHADOW_STRATEGIES, load_state as load_shadow_state
 from wallet_tracker import load_state as load_wallet_state
 
 app = FastAPI(title="Polymarket Live Trading")
@@ -50,8 +51,11 @@ def money(value) -> str:
 def page(title: str, body: str) -> HTMLResponse:
     nav = """
     <div class="nav">
-      <a href="/">BTC 5m</a>
+      <a href="/">5m BTC</a>
       <a href="/?view=15m">15m BTC/ETH</a>
+      <a href="/?view=passive">B2 Passive</a>
+      <a href="/?view=session">B4 Session</a>
+      <a href="/?view=spot">B1 Spot Confirm</a>
       <a href="/?view=arbitrage">Arbitrage</a>
       <a href="/?view=wallets">Wallets</a>
       <a href="/?view=status">Status</a>
@@ -82,11 +86,31 @@ def render_btc() -> HTMLResponse:
         ("Equity", money(state.get("equity", 100)), None, None),
         ("Total PnL", f"{float(state.get('total_pnl', 0) or 0):+.2f}", "pos" if float(state.get("total_pnl", 0) or 0) >= 0 else "neg", None),
         ("Trades", str(state.get("total_trades", 0)), None, f"{state.get('win_count',0)}W/{state.get('loss_count',0)}L"),
-        ("Open Trades", str(len([t for t in trades if t.get('status')=='open'])), None, None),
+        ("Open Trades", str(len([t for t in trades if t.get('status')=='open'])), None, f"{len([t for t in trades if t.get('status')=='awaiting_resolution'])} pending"),
         ("Last Scan", esc((state.get("last_scan") or "")[:19]), None, None),
     ])
     if state.get("last_error"):
         body += f"<div class='card error' style='margin-top:12px'>Error: {esc(state['last_error'])}</div>"
+
+    asset_stats = state.get("asset_stats", {})
+    if asset_stats:
+        body += "<h2>Per-Asset 5m Stats</h2><table><tr><th>Asset</th><th>Status</th><th>Trades</th><th>Open</th><th>Pending</th><th>W/L</th><th>PnL</th></tr>"
+        for asset in ["BTC", "ETH", "SOL"]:
+            stats = asset_stats.get(asset, {})
+            if not stats:
+                continue
+            pnl = float(stats.get("pnl", 0) or 0)
+            status = "trading" if stats.get("trade_enabled") else "watch-only"
+            body += (
+                f"<tr><td>{asset}</td>"
+                f"<td>{status}</td>"
+                f"<td>{stats.get('trades', 0)}</td>"
+                f"<td>{stats.get('open', 0)}</td>"
+                f"<td>{stats.get('pending', 0)}</td>"
+                f"<td>{stats.get('wins', 0)}/{stats.get('losses', 0)}</td>"
+                f"<td class='{'pos' if pnl >= 0 else 'neg'}'>{money(pnl)}</td></tr>"
+            )
+        body += "</table>"
 
     # Last signal
     body += "<h2>Last Signal</h2>"
@@ -104,10 +128,11 @@ def render_btc() -> HTMLResponse:
 
     # Open trades
     open_trades = [t for t in trades if t.get("status") == "open"]
-    body += "<h2>Open Trades</h2><table><tr><th>Window</th><th>Side</th><th>Buy Price</th><th>Shares</th><th>Cost</th><th>Expected PnL</th><th>Entered</th></tr>"
+    body += "<h2>Open Trades</h2><table><tr><th>Asset</th><th>Window</th><th>Side</th><th>Buy Price</th><th>Shares</th><th>Cost</th><th>Expected PnL</th><th>Entered</th></tr>"
     for t in open_trades:
         body += (
-            f"<tr><td>{esc(t.get('question','')[:50])}</td>"
+            f"<tr><td>{esc(t.get('asset') or '')}</td>"
+            f"<td>{esc(t.get('question','')[:50])}</td>"
             f"<td class='pos'>{t.get('winner')}</td>"
             f"<td>${t.get('buy_price')}</td>"
             f"<td>{t.get('shares')}</td>"
@@ -116,8 +141,21 @@ def render_btc() -> HTMLResponse:
             f"<td>{esc((t.get('entry_time') or '')[:19])}</td></tr>"
         )
     if not open_trades:
-        body += "<tr><td colspan='7' class='muted'>No open trades.</td></tr>"
+        body += "<tr><td colspan='8' class='muted'>No open trades.</td></tr>"
     body += "</table>"
+
+    pending_trades = [t for t in trades if t.get("status") == "awaiting_resolution"]
+    if pending_trades:
+        body += "<h2>Awaiting Resolution</h2><table><tr><th>Window</th><th>Side</th><th>Buy</th><th>Cost</th><th>Pending Since</th></tr>"
+        for t in pending_trades[-10:][::-1]:
+            body += (
+                f"<tr><td>{esc(t.get('question','')[:50])}</td>"
+                f"<td>{t.get('winner')}</td>"
+                f"<td>${t.get('buy_price')}</td>"
+                f"<td>{money(t.get('cost'))}</td>"
+                f"<td>{esc((t.get('awaiting_resolution_since') or '')[:19])}</td></tr>"
+            )
+        body += "</table>"
 
     # Trade history
     closed_trades = [t for t in trades if t.get("status") == "closed"]
@@ -136,7 +174,7 @@ def render_btc() -> HTMLResponse:
 
     # Upcoming windows
     windows = state.get("active_windows_summary", [])
-    body += "<h2>Upcoming 5m Windows</h2><table><tr><th>Window</th><th>Time Left</th><th>Volume</th><th>UP Ask</th><th>DOWN Ask</th></tr>"
+    body += "<h2>Upcoming 5m Windows</h2><table><tr><th>Asset</th><th>Status</th><th>Window</th><th>Time Left</th><th>Volume</th><th>Source</th><th>UP Ask</th><th>DOWN Ask</th></tr>"
     for w in windows[:20]:
         secs = w.get("seconds_left", 0)
         mins = secs // 60
@@ -146,9 +184,12 @@ def render_btc() -> HTMLResponse:
         row_cls = " class='pos'" if is_near else ""
         body += (
             f"<tr{row_cls}>"
+            f"<td>{esc(w.get('asset') or '')}</td>"
+            f"<td>{'trading' if w.get('trade_enabled', True) else 'watch-only'}</td>"
             f"<td>{esc(w.get('question','')[:50])}</td>"
             f"<td>{time_str}</td>"
             f"<td>{money(w.get('volume'))}</td>"
+            f"<td>{esc(w.get('volume_source') or 'falcon_market')} ({w.get('trade_count') or '-'})</td>"
             f"<td>${w.get('up_ask','?'):.2f}</td>"
             f"<td>${w.get('down_ask','?'):.2f}</td></tr>"
         )
@@ -160,30 +201,88 @@ def render_btc() -> HTMLResponse:
 def render_arbitrage() -> HTMLResponse:
     state = load_arb_state()
     opps = state.get("opportunities", [])
+    candidates = state.get("candidate_groups", [])
+    rejected = state.get("rejected_groups", [])
+    stats = state.get("scan_stats", {})
     open_positions = [p for p in state.get("positions", []) if p.get("status") == "open"]
     body = stat_cards([
-        ("Bankroll", money(state.get("bankroll", 100)), None, None),
-        ("Equity", money(state.get("equity", 100)), None, None),
-        ("Open Arbs", str(len(open_positions)), None, None),
-        ("Opportunities", str(len(opps)), None, "analytics source only"),
-        ("Total PnL", f"{float(state.get('total_pnl',0) or 0):+.2f}", "pos" if float(state.get("total_pnl",0) or 0) >= 0 else "neg", None),
+        ("Rows Scanned", str(stats.get("rows_scanned", 0)), None, f"{stats.get('ungrouped_rows', 0)} ungrouped"),
+        ("Groups", str(stats.get("groups_found", 0)), None, f"{stats.get('candidate_groups', 0)} candidates"),
+        ("Priced", str(stats.get("groups_priced", 0)), None, f"{stats.get('clob_legs_priced', 0)} CLOB legs"),
+        ("Executable", str(len(opps)), "pos" if opps else None, "verified baskets only"),
+        ("NegRisk Flags", str(stats.get("neg_risk_flags_found", 0)), "warn" if not stats.get("neg_risk_flags_found") else "pos", None),
         ("Last Scan", esc((state.get("last_scan") or "")[:19]), None, None),
     ])
     if state.get("last_error"):
         body += f"<div class='card error' style='margin-top:12px'>Source/error: {esc(state['last_error'])}</div>"
+
+    source = stats.get("source") or "Falcon / Polymarket Analytics"
+    notes = " ".join(state.get("source_notes", []))
+    body += (
+        "<div class='card warn' style='margin-top:12px'>"
+        f"<b>Source:</b> {esc(source)}. {esc(notes)} "
+        "The page prices candidates with executable CLOB asks, but rejects baskets unless the group is verified as negative-risk."
+        "</div>"
+    )
+
     body += "<h2>Open Arbitrage Positions</h2><table><tr><th>Event</th><th>Outcomes</th><th>Cost</th><th>Expected Profit</th><th>Return</th><th>Entered</th></tr>"
     for p in open_positions:
         body += f"<tr><td>{esc(p.get('title'))}</td><td>{p.get('outcomes')}</td><td>{money(p.get('cost'))}</td><td class='pos'>{money(p.get('expected_profit'))}</td><td>{p.get('arb_pct')}%</td><td>{esc((p.get('entry_time') or '')[:19])}</td></tr>"
     if not open_positions:
         body += "<tr><td colspan='6' class='muted'>No open arbitrage positions.</td></tr>"
-    body += "</table><h2>Current Opportunities</h2><table><tr><th>Arb</th><th>Event</th><th>Outcomes</th><th>YES Sum</th><th>Volume</th><th>Top Prices</th></tr>"
+    body += "</table><h2>Executable Opportunities</h2><table><tr><th>Arb</th><th>Event</th><th>Confidence</th><th>YES Sum</th><th>Cost</th><th>Profit</th><th>Leg Prices</th></tr>"
     for r in opps[:40]:
-        badges = " ".join(f"<span class='pill'>{d.get('price')}</span>" for d in r.get("outcome_details", [])[:6])
-        body += f"<tr><td class='pos'>{r.get('arb_pct')}%</td><td>{esc(r.get('title'))}</td><td>{r.get('outcomes')}</td><td>{r.get('yes_sum')}</td><td>{money(r.get('total_volume'))}</td><td>{badges}</td></tr>"
+        badges = " ".join(
+            f"<span class='pill'>{esc(d.get('outcome'))} ${d.get('best_ask')}</span>"
+            for d in r.get("outcome_details", [])[:8]
+        )
+        body += (
+            f"<tr><td class='pos'>{r.get('arb_pct')}%</td>"
+            f"<td>{esc(r.get('title'))}<div class='sub'>{esc(r.get('group_key'))}</div></td>"
+            f"<td>{esc(r.get('confidence'))}</td>"
+            f"<td>{r.get('yes_sum')}</td>"
+            f"<td>{money(r.get('cost'))}</td>"
+            f"<td class='pos'>{money(r.get('expected_profit'))}</td>"
+            f"<td>{badges}</td></tr>"
+        )
     if not opps:
-        body += "<tr><td colspan='6' class='muted'>No analytics arbitrage opportunities.</td></tr>"
+        body += "<tr><td colspan='7' class='muted'>No verified executable arbitrage opportunities right now.</td></tr>"
     body += "</table>"
-    return page("Multi-Outcome Arbitrage", body)
+
+    body += "<h2>Candidate Analysis</h2><table><tr><th>Status</th><th>Group</th><th>Confidence</th><th>Outcomes</th><th>YES Sum</th><th>Arb</th><th>Reason</th><th>Best Asks</th></tr>"
+    for r in candidates[:60]:
+        cls = "pos" if r.get("status") == "executable" else "warn"
+        badges = " ".join(
+            f"<span class='pill'>{esc(d.get('outcome'))} ${d.get('best_ask') or '?'}/sz {d.get('ask_size') or 0}</span>"
+            for d in r.get("outcome_details", [])[:6]
+        )
+        body += (
+            f"<tr><td class='{cls}'>{esc(r.get('status'))}</td>"
+            f"<td>{esc(r.get('title'))}<div class='sub'>{esc(r.get('group_type'))}: {esc(r.get('group_key'))}</div></td>"
+            f"<td>{esc(r.get('confidence'))}</td>"
+            f"<td>{r.get('priced_outcomes')}/{r.get('outcomes')}</td>"
+            f"<td>{r.get('yes_sum')}</td>"
+            f"<td>{r.get('arb_pct')}%</td>"
+            f"<td>{esc(r.get('reason'))}</td>"
+            f"<td>{badges}</td></tr>"
+        )
+    if not candidates:
+        body += "<tr><td colspan='8' class='muted'>No multi-outcome candidate groups found in the latest Falcon scan.</td></tr>"
+    body += "</table>"
+
+    body += "<h2>Rejected Groups</h2><table><tr><th>Group</th><th>YES Sum</th><th>Confidence</th><th>Reason</th><th>Volume</th></tr>"
+    for r in rejected[:30]:
+        body += (
+            f"<tr><td>{esc(r.get('title'))}<div class='sub'>{esc(r.get('group_key'))}</div></td>"
+            f"<td>{r.get('yes_sum')}</td>"
+            f"<td>{esc(r.get('confidence'))}</td>"
+            f"<td>{esc(r.get('reason'))}</td>"
+            f"<td>{money(r.get('total_volume'))}</td></tr>"
+        )
+    if not rejected:
+        body += "<tr><td colspan='5' class='muted'>No rejected priced groups yet.</td></tr>"
+    body += "</table>"
+    return page("Falcon Arbitrage Analysis", body)
 
 
 def render_wallets() -> HTMLResponse:
@@ -218,7 +317,7 @@ def render_15m() -> HTMLResponse:
         ("Equity", money(state.get("equity", 100)), None, None),
         ("Total PnL", f"{float(state.get('total_pnl',0) or 0):+.2f}", "pos" if float(state.get("total_pnl",0) or 0) >= 0 else "neg", None),
         ("Trades", str(state.get("total_trades", 0)), None, f"{state.get('win_count',0)}W/{state.get('loss_count',0)}L"),
-        ("Open Trades", str(len([t for t in trades if t.get('status')=='open'])), None, None),
+        ("Open Trades", str(len([t for t in trades if t.get('status')=='open'])), None, f"{len([t for t in trades if t.get('status')=='awaiting_resolution'])} pending"),
         ("Last Scan", esc((state.get("last_scan") or "")[:19]), None, None),
     ])
     if state.get("last_error"):
@@ -255,6 +354,19 @@ def render_15m() -> HTMLResponse:
         body += "<tr><td colspan='7' class='muted'>No open trades.</td></tr>"
     body += "</table>"
 
+    pending_trades = [t for t in trades if t.get("status") == "awaiting_resolution"]
+    if pending_trades:
+        body += "<h2>Awaiting Resolution</h2><table><tr><th>Window</th><th>Side</th><th>Buy</th><th>Cost</th><th>Pending Since</th></tr>"
+        for t in pending_trades[-10:][::-1]:
+            body += (
+                f"<tr><td>{esc(t.get('question','')[:50])}</td>"
+                f"<td>{t.get('winner')}</td>"
+                f"<td>${t.get('buy_price')}</td>"
+                f"<td>{money(t.get('cost'))}</td>"
+                f"<td>{esc((t.get('awaiting_resolution_since') or '')[:19])}</td></tr>"
+            )
+        body += "</table>"
+
     # Trade history
     closed_trades = [t for t in trades if t.get("status") == "closed"]
     if closed_trades:
@@ -271,7 +383,7 @@ def render_15m() -> HTMLResponse:
         body += "</table>"
 
     # Upcoming windows
-    body += "<h2>Upcoming 15m Windows</h2><table><tr><th>Window</th><th>Time Left</th><th>Volume</th><th>UP Ask</th><th>DOWN Ask</th></tr>"
+    body += "<h2>Upcoming 15m Windows</h2><table><tr><th>Window</th><th>Time Left</th><th>Volume</th><th>Source</th><th>UP Ask</th><th>DOWN Ask</th></tr>"
     for w in windows[:20]:
         secs = w.get("seconds_left", 0)
         mins = secs // 60
@@ -284,6 +396,7 @@ def render_15m() -> HTMLResponse:
             f"<td>{esc(w.get('question','')[:50])}</td>"
             f"<td>{time_str}</td>"
             f"<td>{money(w.get('volume'))}</td>"
+            f"<td>{esc(w.get('volume_source') or 'falcon_market')} ({w.get('trade_count') or '-'})</td>"
             f"<td>${w.get('up_ask','?'):.2f}</td>"
             f"<td>${w.get('down_ask','?'):.2f}</td></tr>"
         )
@@ -292,12 +405,119 @@ def render_15m() -> HTMLResponse:
     return page("15m BTC/ETH Buy-Winner-Late", body)
 
 
+def render_shadow(code: str) -> HTMLResponse:
+    config = SHADOW_STRATEGIES[code]
+    state = load_shadow_state(code)
+    trades = state.get("trades", [])
+    orders = state.get("orders", [])
+    last_signal = state.get("last_signal", {})
+    open_trades = [t for t in trades if t.get("status") == "open"]
+    pending_trades = [t for t in trades if t.get("status") == "awaiting_resolution"]
+    open_orders = [o for o in orders if o.get("status") == "open"]
+
+    body = stat_cards([
+        ("Bankroll", money(state.get("bankroll", 100)), None, f"${state.get('stake', 5)} stake"),
+        ("Equity", money(state.get("equity", 100)), None, None),
+        ("Total PnL", f"{float(state.get('total_pnl',0) or 0):+.2f}", "pos" if float(state.get("total_pnl",0) or 0) >= 0 else "neg", None),
+        ("Trades", str(state.get("total_trades", 0)), None, f"{state.get('win_count',0)}W/{state.get('loss_count',0)}L"),
+        ("Open/Pending", f"{len(open_trades)}/{len(pending_trades)}", None, f"{len(open_orders)} orders"),
+        ("Last Scan", esc((state.get("last_scan") or "")[:19]), None, None),
+    ])
+    if state.get("last_error"):
+        body += f"<div class='card error' style='margin-top:12px'>Error: {esc(state['last_error'])}</div>"
+
+    body += "<h2>Last Signal</h2>"
+    if last_signal:
+        if last_signal.get("executed"):
+            body += f"<div class='card pos'>BUY {esc(last_signal.get('side'))} @ ${last_signal.get('buy_price')} - {last_signal.get('seconds_left')}s left</div>"
+        else:
+            detail = " ".join(
+                f"{k}={v}" for k, v in last_signal.items()
+                if k not in {"executed", "reason"} and v is not None
+            )
+            body += f"<div class='card warn'>{esc(last_signal.get('reason','waiting'))} {esc(detail)}</div>"
+    else:
+        body += "<div class='card muted'>No signal yet.</div>"
+
+    if open_orders:
+        body += "<h2>Open Passive Orders</h2><table><tr><th>Window</th><th>Side</th><th>Limit</th><th>Stake</th><th>Created</th><th>Expires</th></tr>"
+        for o in open_orders[-10:][::-1]:
+            body += (
+                f"<tr><td>{esc(o.get('question','')[:60])}</td>"
+                f"<td>{esc(o.get('side'))}</td>"
+                f"<td>${o.get('limit_price')}</td>"
+                f"<td>{money(o.get('stake'))}</td>"
+                f"<td>{esc(o.get('created_ts'))}</td>"
+                f"<td>{esc(o.get('expires_ts'))}</td></tr>"
+            )
+        body += "</table>"
+
+    body += "<h2>Open Trades</h2><table><tr><th>Window</th><th>Side</th><th>Buy</th><th>Cost</th><th>Expected PnL</th><th>Entered</th></tr>"
+    for t in open_trades:
+        body += (
+            f"<tr><td>{esc(t.get('question','')[:60])}</td>"
+            f"<td>{esc(t.get('side'))}</td>"
+            f"<td>${t.get('buy_price')}</td>"
+            f"<td>{money(t.get('cost'))}</td>"
+            f"<td class='pos'>{money(t.get('expected_profit'))}</td>"
+            f"<td>{esc((t.get('entry_time') or '')[:19])}</td></tr>"
+        )
+    if not open_trades:
+        body += "<tr><td colspan='6' class='muted'>No open trades.</td></tr>"
+    body += "</table>"
+
+    if pending_trades:
+        body += "<h2>Awaiting Resolution</h2><table><tr><th>Window</th><th>Side</th><th>Buy</th><th>Cost</th><th>Pending Since</th></tr>"
+        for t in pending_trades[-10:][::-1]:
+            body += (
+                f"<tr><td>{esc(t.get('question','')[:60])}</td>"
+                f"<td>{esc(t.get('side'))}</td>"
+                f"<td>${t.get('buy_price')}</td>"
+                f"<td>{money(t.get('cost'))}</td>"
+                f"<td>{esc((t.get('awaiting_resolution_since') or '')[:19])}</td></tr>"
+            )
+        body += "</table>"
+
+    closed = [t for t in trades if t.get("status") == "closed"]
+    body += "<h2>Recent Closed Trades</h2><table><tr><th>Window</th><th>Side</th><th>Buy</th><th>PnL</th><th>Actual</th><th>Closed</th></tr>"
+    for t in closed[-15:][::-1]:
+        pnl = float(t.get("actual_pnl", 0) or 0)
+        body += (
+            f"<tr><td>{esc(t.get('question','')[:60])}</td>"
+            f"<td>{esc(t.get('side'))}</td>"
+            f"<td>${t.get('buy_price')}</td>"
+            f"<td class='{'pos' if pnl >= 0 else 'neg'}'>{money(pnl)}</td>"
+            f"<td>{esc(t.get('actual_winner'))}</td>"
+            f"<td>{esc((t.get('exit_time') or '')[:19])}</td></tr>"
+        )
+    if not closed:
+        body += "<tr><td colspan='6' class='muted'>No closed trades yet.</td></tr>"
+    body += "</table>"
+
+    body += "<h2>Watched Windows</h2><table><tr><th>Window</th><th>Time Left</th><th>Volume</th><th>Source</th><th>UP Ask</th><th>DOWN Ask</th></tr>"
+    for w in state.get("active_windows_summary", [])[:12]:
+        secs = int(w.get("seconds_left") or 0)
+        body += (
+            f"<tr><td>{esc(w.get('question','')[:60])}</td>"
+            f"<td>{secs//60}m {secs%60}s</td>"
+            f"<td>{money(w.get('volume'))}</td>"
+            f"<td>{esc(w.get('volume_source'))}</td>"
+            f"<td>{'$' + format(w.get('up_ask'), '.2f') if w.get('up_ask') is not None else '?'}</td>"
+            f"<td>{'$' + format(w.get('down_ask'), '.2f') if w.get('down_ask') is not None else '?'}</td></tr>"
+        )
+    body += "</table>"
+    return page(config.title, body)
+
+
 def render_status() -> HTMLResponse:
     btc = load_btc_state()
+    fifteen = load_15m_state()
     arb = load_arb_state()
     wallets = load_wallet_state()
     body = "<h2>System State</h2><pre class='card'>" + esc(json.dumps({
         "btc": {"last_scan": btc.get("last_scan"), "last_error": btc.get("last_error"), "live_enabled": btc.get("live_enabled")},
+        "btc_eth_15m": {"last_scan": fifteen.get("last_scan"), "last_error": fifteen.get("last_error"), "trades": fifteen.get("total_trades"), "pnl": fifteen.get("total_pnl")},
+        "shadow": {code: {"last_scan": load_shadow_state(code).get("last_scan"), "trades": load_shadow_state(code).get("total_trades"), "pnl": load_shadow_state(code).get("total_pnl")} for code in SHADOW_STRATEGIES},
         "arbitrage": {"last_scan": arb.get("last_scan"), "last_error": arb.get("last_error"), "opportunities": len(arb.get("opportunities", []))},
         "wallets": {"last_scan": wallets.get("last_scan"), "last_error": wallets.get("last_error"), "wallet_count": len(wallets.get("wallets", []))},
     }, indent=2)) + "</pre>"
@@ -314,6 +534,8 @@ async def root(view: str = "btc"):
         return render_status()
     if view == "15m":
         return render_15m()
+    if view in SHADOW_STRATEGIES:
+        return render_shadow(view)
     return render_btc()
 
 
@@ -321,6 +543,8 @@ async def root(view: str = "btc"):
 async def api_state():
     return {
         "btc": load_btc_state(),
+        "btc_eth_15m": load_15m_state(),
+        "shadow": {code: load_shadow_state(code) for code in SHADOW_STRATEGIES},
         "arbitrage": load_arb_state(),
         "wallets": load_wallet_state(),
     }

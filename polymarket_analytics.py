@@ -165,3 +165,24 @@ def first_str(row: dict[str, Any], keys: tuple[str, ...], default: str = "") -> 
         if value is not None:
             return str(value)
     return default
+
+
+def trade_notional(trade: dict[str, Any]) -> float:
+    """Return the USDC notional for one Falcon trade row."""
+    explicit = first_float(trade, ("usdc_size", "cashAmount", "amount", "notional"), None)
+    if explicit is not None:
+        return max(0.0, explicit)
+    price = first_float(trade, ("price",), None)
+    size = first_float(trade, ("size",), None)
+    if price is None or size is None:
+        return 0.0
+    return max(0.0, price * size)
+
+
+def summarize_trades_volume(trades: list[dict[str, Any]]) -> dict[str, Any]:
+    total = sum(trade_notional(trade) for trade in trades)
+    return {
+        "trade_count": len(trades),
+        "trade_volume": round(total, 6),
+        "latest_trade_ts": first_str(trades[0], ("timestamp", "created_at", "time")) if trades else "",
+    }

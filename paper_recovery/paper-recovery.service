@@ -1,0 +1,15 @@
+[Unit]
+Description=Polymarket paper research dashboard and worker
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/projects/scripts/trading-bot
+ExecStart=/usr/bin/python3 -m paper_recovery serve --port 9091 --interval 60
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=20
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

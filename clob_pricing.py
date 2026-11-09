@@ -38,6 +38,22 @@ class BookQuote:
         return asdict(self)
 
 
+@dataclass
+class BuyFill:
+    token_id: str
+    requested_stake: float
+    filled_cost: float
+    shares: float
+    vwap: float | None
+    complete: bool
+    levels: list[dict[str, float]]
+    source: str = "clob_book_vwap"
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 def _parse_json_list(value: Any) -> list[Any]:
     if isinstance(value, list):
         return value
@@ -122,6 +138,59 @@ def quote_from_book(token_id: str, book: dict[str, Any] | None, outcome: str = "
         spread=spread,
         bid_depth=round(bid_depth, 4),
         ask_depth=round(ask_depth, 4),
+    )
+
+
+def simulate_buy_fill(token_id: str, book: dict[str, Any] | None, stake: float) -> BuyFill:
+    """Walk ask levels and simulate filling a dollar stake at executable asks."""
+    requested_stake = round(max(0.0, float(stake or 0)), 4)
+    if requested_stake <= 0:
+        return BuyFill(str(token_id), requested_stake, 0.0, 0.0, None, False, [], error="invalid_stake")
+    if not book:
+        return BuyFill(str(token_id), requested_stake, 0.0, 0.0, None, False, [], error="missing_book")
+
+    ask_levels = []
+    for level in book.get("asks") or []:
+        price = _level_price(level)
+        size = _level_size(level)
+        if price is None or size <= 0:
+            continue
+        ask_levels.append((price, size))
+    ask_levels.sort(key=lambda item: item[0])
+
+    remaining = requested_stake
+    filled_cost = 0.0
+    shares = 0.0
+    used_levels: list[dict[str, float]] = []
+    for price, available_shares in ask_levels:
+        if remaining <= 0:
+            break
+        max_level_cost = price * available_shares
+        level_cost = min(remaining, max_level_cost)
+        level_shares = level_cost / price
+        if level_shares <= 0:
+            continue
+        used_levels.append({
+            "price": round(price, 6),
+            "available_shares": round(available_shares, 4),
+            "filled_shares": round(level_shares, 4),
+            "filled_cost": round(level_cost, 4),
+        })
+        filled_cost += level_cost
+        shares += level_shares
+        remaining -= level_cost
+
+    complete = filled_cost + 0.0001 >= requested_stake
+    vwap = round(filled_cost / shares, 6) if shares > 0 else None
+    return BuyFill(
+        token_id=str(token_id),
+        requested_stake=round(requested_stake, 4),
+        filled_cost=round(filled_cost, 4),
+        shares=round(shares, 4),
+        vwap=vwap,
+        complete=complete,
+        levels=used_levels,
+        error=None if shares > 0 else "no_asks",
     )
 
 
